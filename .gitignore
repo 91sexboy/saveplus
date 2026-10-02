@@ -1,0 +1,33 @@
+# 依赖与测试临时目录
+node_modules/
+.test-tmp/
+
+# 本地研究用的独立项目（自带 Git 仓库与含凭据的 .env），不属于本仓库
+tgcare/
+
+# 凭据与本地环境
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# 在本目录直接运行时可能生成的宿主数据（规则、任务、归档、中转文件）
+assets/
+temp/
+
+# 日志与编辑器／系统文件
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 不公开的开发资料：研究报告、开发辅助配置、术语表、规格与工单
+docs/research/
+docs/agents/
+CLAUDE.md
+CONTEXT.md
+.scratch/
+todo.md

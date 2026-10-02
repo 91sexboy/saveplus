@@ -1,0 +1,22 @@
+{
+  "name": "saveplus-dev",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Development and test harness for the saveplus TeleBox plugin (deliverable: saveplus.ts)",
+  "type": "commonjs",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "lowdb": "7.0.1",
+    "teleproto": "1.229.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}
