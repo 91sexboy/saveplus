@@ -252,3 +252,41 @@ test("05 手动保存遇到限流时，后台任务也一起冷却（限流针�
   assert.ok(h.engine.limiter.cooldownRemainingMs > 0 && h.engine.manualLimiter.cooldownRemainingMs > 0);
   await h.stop();
 });
+
+test("修复：重新处理中的任务显示“上次失败原因”，不再显示过期的下次尝试时间", async () => {
+  const h = await createHarness();
+  await addDefaultRule(h);
+  let release!: () => void;
+  h.tg.sendGate = new Promise<void>((r) => (release = r));
+  h.tg.failures.stage.push(new SavePlusError("network", "服务器暂时不可用（TIMEOUT）", { transient: true }));
+  await h.emit("-1001", { id: 1870, kind: "video", cover: "custom" });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(h.task(1).status, "sending");
+  assert.equal(h.task(1).attempts, 1);
+  const show = await h.cmd(".saveplus task show 1");
+  assert.match(show, /\[发送中\]/);
+  assert.match(show, /上次失败原因：服务器暂时不可用（TIMEOUT）/);
+  assert.doesNotMatch(show, /下次尝试/);
+  assert.match(await h.cmd(".saveplus task"), /— 上次失败：服务器暂时不可用/);
+  release();
+  h.tg.sendGate = undefined;
+  await h.idle();
+  assert.equal(h.task(1).status, "done");
+  await h.stop();
+});
+
+test("修复：任务详情显示尚未下载完成的文件进度", async () => {
+  const h = await createHarness();
+  await addDefaultRule(h);
+  h.tg.failures.stage.push((ctx) => {
+    const dir = path.join(h.stagingDir, "task_1");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "m5_clip.mp4.part"), Buffer.alloc(3 * 1024 * 1024));
+    void ctx;
+    return new SavePlusError("permission", "没有访问或发送权限");
+  });
+  await h.emit("-1001", { id: 5, kind: "video", cover: "custom" });
+  await h.idle();
+  assert.match(await h.cmd(".saveplus task show 1"), /正在下载：消息 5 已下载 3\.0 MB/);
+  await h.stop();
+});

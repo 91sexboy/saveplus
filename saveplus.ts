@@ -1537,13 +1537,9 @@ export class TeleprotoPort implements TelegramPort {
       const ext = path.extname(attrs.fileName || "") || MIME_EXT[doc.mimeType] || ".bin";
       const name = sanitizeFileName(attrs.fileName || `${message.kind}${ext}`, `${message.kind}${ext}`);
       const file = path.join(dir, `m${message.id}_${name}`);
-      await this.client.downloadMedia(raw, { outputFile: file, signal } as never);
-      if (!fs.existsSync(file)) throw new SavePlusError("network", "媒体下载失败（文件未生成）", { transient: true });
-      const actual = fs.statSync(file).size;
       const expected = Number(doc.size);
-      if (Number.isFinite(expected) && expected > 0 && actual !== expected) {
-        throw new SavePlusError("network", `媒体下载不完整（${actual}/${expected} 字节）`, { transient: true });
-      }
+      await this.resumableDownload(raw, file, expected, signal);
+      const actual = fs.statSync(file).size;
       item.mediaFile = file;
       item.mimeType = doc.mimeType;
       item.size = actual;
@@ -1568,6 +1564,52 @@ export class TeleprotoPort implements TelegramPort {
     } catch (e) {
       throw classifyError(e, "read");
     }
+  }
+
+  /** 分段下载的块大小（服务器上限 1 MB，须为 4096 的倍数）。 */
+  static readonly DOWNLOAD_CHUNK = 1024 * 1024;
+
+  /**
+   * 可续传下载：先写入 “文件名.part”，按整块继续上次的进度；下载完整后改名为正式文件。
+   * 失败时保留 .part（位于任务中转目录内），下一次重试或重启后从断点继续。
+   */
+  private async resumableDownload(raw: Api.Message, file: string, expected: number, signal?: AbortSignal): Promise<void> {
+    const known = Number.isFinite(expected) && expected > 0;
+    if (known && fs.existsSync(file) && fs.statSync(file).size === expected) return;
+    const chunk = TeleprotoPort.DOWNLOAD_CHUNK;
+    const part = `${file}.part`;
+    let offset = 0;
+    if (fs.existsSync(part)) {
+      const have = fs.statSync(part).size;
+      offset = Math.floor(have / chunk) * chunk;
+      if (known && offset > expected) offset = 0;
+      if (offset !== have) await fsp.truncate(part, offset);
+    }
+    const handle = await fsp.open(part, offset > 0 ? "r+" : "w");
+    let pos = offset;
+    try {
+      for await (const bytes of this.client.iterDownload(raw, {
+        offset: tgHelpers.returnBigInt(offset),
+        requestSize: chunk,
+        signal,
+      })) {
+        await handle.write(bytes, 0, bytes.length, pos);
+        pos += bytes.length;
+      }
+    } catch (e) {
+      const c = classifyError(e, "read");
+      const progress = known ? `已下载 ${formatBytes(pos)}／${formatBytes(expected)}` : `已下载 ${formatBytes(pos)}`;
+      throw new SavePlusError(c.code, `${c.message}（${progress}，重试时从断点继续）`, {
+        transient: c.transient,
+        seconds: c.seconds,
+      });
+    } finally {
+      await handle.close();
+    }
+    if (known && pos !== expected) {
+      throw new SavePlusError("network", `媒体下载不完整（${pos}/${expected} 字节），重试时从断点继续`, { transient: true });
+    }
+    await fsp.rename(part, file);
   }
 
   private async uploadLocal(file: string, workers = 4): Promise<Api.TypeInputFile> {
@@ -2394,6 +2436,7 @@ export class Engine {
       const claimed = await this.store.update(() => {
         if (t.status !== "queued" && t.status !== "retry_wait") return false;
         t.status = "running";
+        t.nextAttemptAt = undefined;
         t.stagingDir = t.stagingDir ?? this.stagingDirFor(t);
         t.updatedAt = this.clock.now();
         return true;
@@ -4225,8 +4268,30 @@ export class SavePlusCore {
       .map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`))
       .join(",");
     const kind = t.kind === "backfill" ? "补漏" : t.kind === "backup" ? `备份#${t.jobId}` : t.editVersion ? "监视·编辑版" : "监视";
-    const err = t.lastError && t.status !== "done" ? ` — ${htmlEscape(t.lastError.message.slice(0, 120))}` : "";
+    const active = t.status === "queued" || t.status === "running" || t.status === "sending";
+    const err =
+      t.lastError && t.status !== "done"
+        ? ` — ${active ? "上次失败：" : ""}${htmlEscape(t.lastError.message.slice(0, 120))}`
+        : "";
     return `#${t.id} [${STATUS_LABEL[t.status]}] ${kind} ${htmlEscape(t.sourceTitle)}:${ids} → ${htmlEscape(targetLabel(t.target))}${err}`;
+  }
+
+  /** 列出任务中转目录里尚未下载完成的文件及已下载大小。 */
+  private partialDownloads(t: TaskRecord): string | undefined {
+    const dir = t.stagingDir;
+    if (!dir || !fs.existsSync(dir)) return undefined;
+    try {
+      const parts = fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith(".part"))
+        .map((f) => {
+          const id = /^m(\d+)_/.exec(f)?.[1];
+          return `消息 ${id ?? "?"} 已下载 ${formatBytes(fs.statSync(path.join(dir, f)).size)}`;
+        });
+      return parts.length ? parts.join("，") : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async taskCommand(msg: CommandMessage, args: string[]): Promise<void> {
@@ -4261,7 +4326,12 @@ export class SavePlusCore {
           `规则：#${t.ruleId} · 创建：${new Date(t.createdAt).toLocaleString()} · 更新：${new Date(t.updatedAt).toLocaleString()}`,
           `重试：${t.attempts} 次 · 限流等待：${t.floodWaits} 次${t.force ? " · 强制重存" : ""}${t.allowNoCover ? " · 接受无封面" : ""}`,
         ];
-        if (t.nextAttemptAt) lines.push(`下次尝试：${new Date(t.nextAttemptAt).toLocaleString()}`);
+        const active = t.status === "queued" || t.status === "running" || t.status === "sending";
+        if (t.nextAttemptAt && (t.status === "retry_wait" || t.status === "cleanup_pending")) {
+          lines.push(`下次尝试：${new Date(t.nextAttemptAt).toLocaleString()}`);
+        }
+        const partial = this.partialDownloads(t);
+        if (partial) lines.push(`正在下载：${partial}`);
         if (t.staged?.length) {
           lines.push(
             `中转文件：${t.staged
@@ -4272,7 +4342,7 @@ export class SavePlusCore {
         }
         if (t.result) lines.push(`目标消息：${t.result.messageIds.join(", ")}（确认方式：${t.result.via}）`);
         for (const w of t.warnings || []) lines.push(`⚠️ ${htmlEscape(w)}`);
-        if (t.lastError) lines.push(`原因：${htmlEscape(t.lastError.message)}`);
+        if (t.lastError) lines.push(`${active ? "上次失败原因" : "原因"}：${htmlEscape(t.lastError.message)}`);
         return this.reply(msg, lines.join("\n"));
       }
       case "retry": {

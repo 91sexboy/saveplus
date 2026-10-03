@@ -13,6 +13,12 @@ import {
 import { makeRoot } from "./helpers/harness";
 
 const B = (n: number | string) => helpers.returnBigInt(n);
+/** 与位置相关的确定性字节，用于校验续传拼接是否正确。 */
+function patternBytes(offset: number, len: number): Buffer {
+  const out = Buffer.alloc(len);
+  for (let i = 0; i < len; i++) out[i] = (offset + i) % 251;
+  return out;
+}
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 9, 9, 9]);
 
 function coverPhoto(id: number): Api.Photo {
@@ -91,12 +97,23 @@ class RecordingClient {
     this.calls.push({ name: "getMessages", arg: params });
     return [];
   }
-  async downloadMedia(raw: Api.Message, opts: any) {
-    this.calls.push({ name: "downloadMedia", arg: raw.id, opts });
+  /** 在第 n 块之后抛出 TIMEOUT（模拟大文件下载中途超时），每次调用消耗一项。 */
+  failAfterChunks: number[] = [];
+  downloadOffsets: number[] = [];
+  async *iterDownload(raw: Api.Message, params: any) {
     const doc = (raw.media as Api.MessageMediaDocument).document as Api.Document;
-    const size = Number(doc.size) - (this.shortDownload ? 10 : 0);
-    fs.writeFileSync(opts.outputFile, Buffer.alloc(size, 1));
-    return opts.outputFile;
+    const total = Number(doc.size) - (this.shortDownload ? 10 : 0);
+    let offset = Number(params.offset ?? 0);
+    this.downloadOffsets.push(offset);
+    const failAt = this.failAfterChunks.shift();
+    let n = 0;
+    while (offset < total) {
+      if (failAt !== undefined && n === failAt) throw new tgErrors.RPCError("TIMEOUT", undefined as never, -503);
+      const len = Math.min(params.requestSize, total - offset);
+      yield patternBytes(offset, len);
+      offset += len;
+      n++;
+    }
   }
   async downloadFile(location: any, opts: any) {
     this.calls.push({ name: "downloadFile", arg: location, opts });
@@ -394,4 +411,42 @@ test("14 原生转发传入隐藏发送者、静音与话题参数", async () =>
   const ids = await port(client).forwardMessages({ peerId: "-1002002", title: "dst", topicId: 9 }, "-1001001", [5, 6], { dropAuthor: true, silent: true });
   assert.deepEqual(ids, [105, 106]);
   assert.deepEqual([captured.messages, captured.dropAuthor, captured.silent, captured.topMsgId], [[5, 6], true, true, 9]);
+});
+
+
+test("修复：大文件下载中途超时后从断点续传，最终内容完整且不重复下载已完成的部分", async () => {
+  const root = await makeRoot();
+  const client = new RecordingClient();
+  const p = port(client);
+  const chunk = TeleprotoPort.DOWNLOAD_CHUNK;
+  const size = chunk * 3 + 12345;
+  const raw = message(70, new Api.MessageMediaDocument({ document: videoDoc(51, { size }) }));
+  client.failAfterChunks.push(2);
+  await assert.rejects(p.stageMedia(p.toSourceMessage(raw)!, root), (e: any) => {
+    assert.equal(e.code, "network");
+    assert.equal(e.transient, true);
+    assert.match(e.message, /服务器暂时不可用（TIMEOUT）（已下载 2\.0 MB／3\.0 MB，重试时从断点继续）/);
+    return true;
+  });
+  const part = path.join(root, "m70_clip.mp4.part");
+  assert.equal(fs.statSync(part).size, chunk * 2);
+  const item = await p.stageMedia(p.toSourceMessage(raw)!, root);
+  assert.deepEqual(client.downloadOffsets, [0, chunk * 2], "第二次从 2 MB 处继续");
+  assert.ok(!fs.existsSync(part));
+  assert.ok(fs.readFileSync(item.mediaFile!).equals(patternBytes(0, size)), "拼接后的内容与来源一致");
+  await p.stageMedia(p.toSourceMessage(raw)!, root);
+  assert.equal(client.downloadOffsets.length, 2, "已完整下载的文件不会重复下载");
+});
+
+test("修复：续传时丢弃末尾不完整的块，从整块边界重新下载", async () => {
+  const root = await makeRoot();
+  const client = new RecordingClient();
+  const p = port(client);
+  const chunk = TeleprotoPort.DOWNLOAD_CHUNK;
+  const size = chunk * 2 + 100;
+  const raw = message(71, new Api.MessageMediaDocument({ document: videoDoc(61, { size }) }));
+  fs.writeFileSync(path.join(root, "m71_clip.mp4.part"), Buffer.concat([patternBytes(0, chunk), Buffer.alloc(777, 9)]));
+  const item = await p.stageMedia(p.toSourceMessage(raw)!, root);
+  assert.deepEqual(client.downloadOffsets, [chunk]);
+  assert.ok(fs.readFileSync(item.mediaFile!).equals(patternBytes(0, size)));
 });
