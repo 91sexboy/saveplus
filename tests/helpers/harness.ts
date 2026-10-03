@@ -52,8 +52,12 @@ export class FakeClock implements Clock {
 
 export interface FakeMsgInit {
   id: number;
-  kind?: MediaKind;
+  /** "service" 表示系统消息：读取历史时会出现，但不能保存。 */
+  kind?: MediaKind | "service";
+  editDate?: number;
   text?: string;
+  /** 消息带内联按钮。 */
+  buttons?: boolean;
   groupedId?: string;
   cover?: CoverKind;
   size?: number;
@@ -77,6 +81,8 @@ type Injected = SavePlusError | Error | ((ctx: unknown) => SavePlusError | Error
 export interface SendRecord {
   op: "forward" | "text" | "staged";
   target: PeerTarget;
+  silent?: boolean;
+  dropAuthor?: boolean;
   sourceChatId?: string;
   ids?: number[];
   text?: string;
@@ -106,6 +112,7 @@ export class FakeTelegram implements TelegramPort {
   };
   /** 发送请求“已送达但响应丢失”：记录送达后再抛出。 */
   deliverThenFail: SavePlusError[] = [];
+  forwardDeliverThenFail: SavePlusError[] = [];
   beforeSendResolve?: (items: StagedItem[]) => Promise<void> | void;
   stageCalls: number[] = [];
   sendWarnings: string[][] = [];
@@ -171,12 +178,13 @@ export class FakeTelegram implements TelegramPort {
   toSourceMessage(raw: unknown): SourceMessage | null {
     this.convertCalls++;
     const r = raw as FakeRaw;
-    if (!r || r.__fake !== true) return null;
-    const kind = r.kind ?? "photo";
+    if (!r || r.__fake !== true || r.kind === "service") return null;
+    const kind = (r.kind ?? "photo") as MediaKind;
     return {
       chatId: r.chatId,
       id: r.id,
       date: r.date,
+      editDate: r.editDate,
       out: Boolean(r.out),
       groupedId: r.groupedId,
       kind,
@@ -190,6 +198,7 @@ export class FakeTelegram implements TelegramPort {
       unsupportedReason: r.unsupportedReason,
       webPreview: Boolean(r.webPreview),
       noforwards: Boolean(r.noforwards),
+      hasButtons: Boolean(r.buttons),
       raw: r,
     };
   }
@@ -224,6 +233,7 @@ export class FakeTelegram implements TelegramPort {
         reuploadable: true,
         webPreview: false,
         noforwards: false,
+        hasButtons: false,
         raw: null,
       });
     }
@@ -231,7 +241,12 @@ export class FakeTelegram implements TelegramPort {
     return ids;
   }
 
-  async forwardMessages(target: PeerTarget, sourceChatId: string, ids: number[]): Promise<number[]> {
+  async forwardMessages(
+    target: PeerTarget,
+    sourceChatId: string,
+    ids: number[],
+    opts: { dropAuthor?: boolean; silent?: boolean } = {}
+  ): Promise<number[]> {
     this.take(this.failures.forward, { target, sourceChatId, ids });
     const src = this.peers.get(sourceChatId);
     const raws = ids.map((id) => this.messages.get(sourceChatId)?.get(id));
@@ -240,9 +255,11 @@ export class FakeTelegram implements TelegramPort {
     }
     const resultIds = this.deliver(
       target,
-      raws.map((r) => ({ kind: r?.kind, text: r?.text }))
+      raws.map((r) => ({ kind: r?.kind === "service" ? "other" : r?.kind, text: r?.text }))
     );
-    this.sent.push({ op: "forward", target, sourceChatId, ids, resultIds });
+    this.sent.push({ op: "forward", target, sourceChatId, ids, resultIds, dropAuthor: opts.dropAuthor, silent: opts.silent });
+    const late = this.forwardDeliverThenFail.shift();
+    if (late) throw late;
     return resultIds;
   }
 
@@ -250,11 +267,11 @@ export class FakeTelegram implements TelegramPort {
     target: PeerTarget,
     text: string,
     _entities: EntityJson[],
-    opts: { html?: boolean; replyTo?: number } = {}
+    opts: { html?: boolean; replyTo?: number; silent?: boolean } = {}
   ): Promise<number> {
     this.take(this.failures.text, { target, text });
     const [id] = this.deliver(target, [{ kind: "text", text }]);
-    this.sent.push({ op: "text", target, text, html: opts.html, replyTo: opts.replyTo, resultIds: [id] });
+    this.sent.push({ op: "text", target, text, html: opts.html, replyTo: opts.replyTo, silent: opts.silent, resultIds: [id] });
     return id;
   }
 
@@ -297,7 +314,7 @@ export class FakeTelegram implements TelegramPort {
     return item;
   }
 
-  async sendStaged(target: PeerTarget, items: StagedItem[]): Promise<SentResult> {
+  async sendStaged(target: PeerTarget, items: StagedItem[], opts: { silent?: boolean } = {}): Promise<SentResult> {
     if (this.sendGate) await this.sendGate;
     this.take(this.failures.send, { target, items });
     const files = items.flatMap((it) => [it.mediaFile, it.coverFile, it.thumbFile].filter(Boolean) as string[]);
@@ -306,11 +323,30 @@ export class FakeTelegram implements TelegramPort {
       target,
       items.map((it) => ({ kind: it.kind, text: it.text, size: it.size }))
     );
-    this.sent.push({ op: "staged", target, items: JSON.parse(JSON.stringify(items)), filesExisted, resultIds });
+    this.sent.push({ op: "staged", target, items: JSON.parse(JSON.stringify(items)), filesExisted, resultIds, silent: opts.silent });
     if (this.beforeSendResolve) await this.beforeSendResolve(items);
     const late = this.deliverThenFail.shift();
     if (late) throw late;
     return { messageIds: resultIds, warnings: this.sendWarnings.shift() ?? [] };
+  }
+
+  historyCalls: Array<{ chatId: string; ascending: boolean; afterId?: number; beforeId?: number }> = [];
+
+  async getHistory(
+    chatId: string,
+    opts: { ascending: boolean; afterId?: number; beforeId?: number; limit: number }
+  ): Promise<{ messages: SourceMessage[]; rawIds: number[] }> {
+    this.historyCalls.push({ chatId, ascending: opts.ascending, afterId: opts.afterId, beforeId: opts.beforeId });
+    this.take(this.failures.read, { chatId, opts });
+    const all = Array.from(this.messages.get(chatId)?.values() ?? []).sort((a, b) => a.id - b.id);
+    const page = opts.ascending
+      ? all.filter((m) => m.id > (opts.afterId ?? 0)).slice(0, opts.limit)
+      : all
+          .filter((m) => !opts.beforeId || m.id < opts.beforeId)
+          .reverse()
+          .slice(0, opts.limit);
+    const messages = page.map((m) => this.toSourceMessage(m)).filter((m): m is SourceMessage => Boolean(m));
+    return { messages, rawIds: page.map((m) => m.id) };
   }
 
   async findRecentOwn(target: PeerTarget, sinceUnix: number, limit: number): Promise<SourceMessage[]> {
@@ -325,6 +361,8 @@ export class FakeTelegram implements TelegramPort {
 export const FAST_OPTIONS: Partial<SavePlusOptions> = {
   minIntervalMs: 0,
   maxPerMinute: 10_000,
+  manualMinIntervalMs: 0,
+  manualMaxPerMinute: 10_000,
   albumDebounceMs: 100,
   backoffBaseMs: 1000,
   backoffMaxMs: 60_000,
@@ -335,6 +373,8 @@ export const FAST_OPTIONS: Partial<SavePlusOptions> = {
 export interface CommandOptions {
   chat?: string;
   reply?: number;
+  /** 前若干次编辑命令消息时抛错（例如消息已被删除）。 */
+  failEdits?: number;
 }
 
 const tmpRoot = path.join(__dirname, "..", "..", ".test-tmp");
@@ -415,11 +455,16 @@ export class Harness {
 
   async cmd(text: string, opts: CommandOptions = {}): Promise<string> {
     const edits: string[] = [];
+    let failures = opts.failEdits ?? 0;
     const msg = {
       message: text,
       chatId: opts.chat ?? "777",
       replyTo: opts.reply !== undefined ? { replyToMsgId: opts.reply } : undefined,
       edit: async (p: { text: string }) => {
+        if (failures > 0) {
+          failures--;
+          throw Object.assign(new Error("MESSAGE_ID_INVALID"), { errorMessage: "MESSAGE_ID_INVALID" });
+        }
         edits.push(p.text);
         this.edits.push(p.text);
       },

@@ -364,3 +364,34 @@ test("08 文案实体可序列化并重建（无法重建的提及降级为纯�
   assert.equal(String((back[1] as Api.MessageEntityCustomEmoji).documentId), "5368324170671202286");
   assert.equal((back[2] as Api.MessageEntityPre).language, "ts");
 });
+
+test("14 读取历史：正序用 reverse+offsetId、倒序用 offsetId；返回含系统消息的原始 ID 以推进游标", async () => {
+  const client = new RecordingClient();
+  client.entities.set("-1001001", new Api.Channel({ id: B(1001), title: "src", photo: new Api.ChatPhotoEmpty(), date: 1, broadcast: true }));
+  const svc = new Api.MessageService({ id: 3, peerId: new Api.PeerChannel({ channelId: B(1001) }), date: 1, action: new Api.MessageActionEmpty() });
+  client.getMessages = async (_e: unknown, params: any) => {
+    client.calls.push({ name: "getMessages", arg: params });
+    return [message(2, undefined, "a"), svc, message(4, undefined, "b")] as never;
+  };
+  const p = port(client);
+  const asc = await p.getHistory("-1001001", { ascending: true, afterId: 1, limit: 100 });
+  assert.deepEqual(client.calls.at(-1)?.arg, { limit: 100, reverse: true, offsetId: 1 });
+  assert.deepEqual(asc.rawIds, [2, 3, 4]);
+  assert.deepEqual(asc.messages.map((m) => m.id), [2, 4]);
+  await p.getHistory("-1001001", { ascending: false, beforeId: 50, limit: 20 });
+  assert.deepEqual(client.calls.at(-1)?.arg, { limit: 20, offsetId: 50 });
+});
+
+test("14 原生转发传入隐藏发送者、静音与话题参数", async () => {
+  const client = new RecordingClient() as RecordingClient & { forwardMessages?: unknown };
+  client.entities.set("-1001001", new Api.Channel({ id: B(1001), title: "src", photo: new Api.ChatPhotoEmpty(), date: 1, broadcast: true }));
+  client.entities.set("-1002002", new Api.Channel({ id: B(2002), title: "dst", photo: new Api.ChatPhotoEmpty(), date: 1, broadcast: true, creator: true }));
+  let captured: any;
+  client.forwardMessages = async (_to: unknown, params: any) => {
+    captured = params;
+    return params.messages.map((id: number) => message(id + 100, undefined));
+  };
+  const ids = await port(client).forwardMessages({ peerId: "-1002002", title: "dst", topicId: 9 }, "-1001001", [5, 6], { dropAuthor: true, silent: true });
+  assert.deepEqual(ids, [105, 106]);
+  assert.deepEqual([captured.messages, captured.dropAuthor, captured.silent, captured.topMsgId], [[5, 6], true, true, 9]);
+});

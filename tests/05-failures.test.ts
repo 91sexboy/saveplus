@@ -196,3 +196,59 @@ test("10 取消任务释放保存权并删除中转文件；已成功的任务�
   assert.equal(h.data.tasks.filter((t) => t.memberIds[0] === 1 && t.status === "done").length, 1);
   await h.stop();
 });
+
+test("05 限流针对整个账号：等待期间后续任务不会抢先发送，保持原始顺序", async () => {
+  const h = await createHarness();
+  await addDefaultRule(h);
+  h.tg.failures.send.push(flood(60));
+  for (const id of [1, 2, 3]) await h.emit("-1001", { id, kind: "photo" });
+  await h.idle();
+  assert.deepEqual(h.tg.stagedSends().map((s) => s.items?.[0].messageId), [1, 2, 3]);
+  await h.stop();
+});
+
+test("05 单条任务的瞬时错误不阻塞后续任务", async () => {
+  const h = await createHarness({ options: { backoffBaseMs: 600_000 } });
+  await addDefaultRule(h);
+  h.clock.autoAdvanceMaxMs = 1000;
+  h.tg.failures.send.push(net());
+  for (const id of [1, 2]) await h.emit("-1001", { id, kind: "photo" });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(h.task(1).status, "retry_wait");
+  assert.equal(h.task(2).status, "done");
+  h.clock.autoAdvanceMaxMs = Number.POSITIVE_INFINITY;
+  h.clock.advance(600_000);
+  await h.idle();
+  assert.equal(h.task(1).status, "done");
+  await h.stop();
+});
+
+test("05 发送节奏：监视、补漏与备份固定 3 秒一条；普通手动保存沿用 save 的 0.5 秒间隔", async () => {
+  const h = await createHarness({
+    options: { minIntervalMs: 3000, maxPerMinute: 20, manualMinIntervalMs: 500, manualMaxPerMinute: 120 },
+  });
+  await addDefaultRule(h);
+  for (let i = 1; i <= 5; i++) h.tg.addMessage("-1009", { id: i, kind: "text", text: `${i}` });
+  const m0 = h.clock.now();
+  await h.cmd(".saveplus t.me/c/9/1 t.me/c/9/2 t.me/c/9/3 t.me/c/9/4 t.me/c/9/5 @dstchan");
+  assert.equal(h.clock.now() - m0, 2000, "手动保存 5 条：4 个 0.5 秒间隔");
+
+  const stamps: number[] = [];
+  h.tg.beforeSendResolve = () => void stamps.push(h.clock.now());
+  for (let i = 1; i <= 4; i++) await h.emit("-1001", { id: i, kind: "photo" });
+  await h.idle();
+  assert.deepEqual(stamps.slice(1).map((t, i) => t - stamps[i]), [3000, 3000, 3000]);
+  await h.stop();
+});
+
+test("05 手动保存遇到限流时，后台任务也一起冷却（限流针对整个账号）", async () => {
+  const h = await createHarness();
+  h.tg.addMessage("-1001", { id: 1, kind: "text", text: "x" });
+  h.tg.failures.forward.push(flood(40));
+  await h.cmd(".saveplus t.me/srcchan/1 @dstchan");
+  // 手动保存等待后成功；此刻的冷却已结束，确认两个限速器都记录过冷却。
+  assert.equal(h.tg.sent.filter((s) => s.op === "forward").length, 1);
+  h.engine.applyFloodCooldown(10_000);
+  assert.ok(h.engine.limiter.cooldownRemainingMs > 0 && h.engine.manualLimiter.cooldownRemainingMs > 0);
+  await h.stop();
+});

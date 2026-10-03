@@ -9,11 +9,12 @@ test("01 默认导出可被宿主校验，只注册 saveplus 命令，帮助随�
   assert.equal(isValidPlugin(defaultPlugin), true);
   assert.deepEqual(Object.keys(defaultPlugin.cmdHandlers), ["saveplus"]);
   assert.equal(defaultPlugin.name, "saveplus");
-  assert.equal(defaultPlugin.listenMessageHandlerIgnoreEdited, true);
+  // 接收编辑事件，但只有开启“编辑后再存一份”的规则才会处理（见 04、14 的测试）。
+  assert.equal(defaultPlugin.listenMessageHandlerIgnoreEdited, false);
   setPrefixes(["!", "！"]);
   try {
     const help = (defaultPlugin.description as () => string)();
-    assert.match(help, /<code>!saveplus rule add 来源 目标<\/code>/);
+    assert.match(help, /<code>!saveplus rule add 来源 目标 \[选项…\]<\/code>/);
     assert.doesNotMatch(help, /\.saveplus/);
   } finally {
     setPrefixes([".", "。", "$"]);

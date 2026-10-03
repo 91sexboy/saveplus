@@ -3,12 +3,13 @@
  *
  * 在保留 save 插件手动保存能力（回复／链接／批量／闭区间／默认与临时目标／收藏夹／
  * 来源说明／本地归档）的基础上，提供：
- *   - 在线监视：只处理宿主投递的新消息事件，不主动扫描离线历史，不跟随编辑；
+ *   - 在线监视：只处理宿主投递的新消息事件，不主动扫描离线历史；默认不跟随编辑（可按规则开启“编辑后再存一份”）；
  *   - 监视过滤：消息类型 + 关键词黑名单 + 正则白名单共同生效，相册整组过滤；
  *   - 本地中转：下载到本地 → 携带来源视频封面上传 → 确认成功并持久记录 → 清理中转副本；
  *   - 成功去重：同一来源消息向同一目标成功保存后，监视与手动补漏默认跳过；
  *   - 手动补漏：按指定监视规则与消息范围补齐离线缺口，可显式强制重存；
- *   - 持久任务：失败、待处理、结果不确定的任务及中转文件都会保留，可查询、重试。
+ *   - 持久任务：失败、待处理、结果不确定的任务及中转文件都会保留，可查询、重试；
+ *   - 搬自 shift：整个历史备份、原生转发与隐藏发送者、静音、统计、规则导出导入（含导入 shift 规则）。
  *
  * 依赖宿主：@utils/pluginBase、@utils/pluginManager、@utils/runtimeManager、
  *           @utils/pathHelpers、@utils/htmlEscape，以及宿主自带的 teleproto 与 lowdb。
@@ -92,10 +93,13 @@ const KIND_ALIASES: Record<string, MediaKind> = {
 };
 
 export interface SavePlusOptions {
-  /** 相邻两次发送的最小间隔（毫秒）。 */
+  /** 监视、补漏与备份：相邻两次发送的最小间隔（毫秒）。 */
   minIntervalMs: number;
-  /** 60 秒滑动窗口内的最大发送次数（相册计 1 次）。 */
+  /** 监视、补漏与备份：60 秒滑动窗口内的最大发送次数（相册计 1 次）。 */
   maxPerMinute: number;
+  /** 普通手动保存的发送间隔与每分钟上限（沿用 save 的节奏，不受上面的固定间隔约束）。 */
+  manualMinIntervalMs: number;
+  manualMaxPerMinute: number;
   /** 相册成员聚合的静默窗口（毫秒），以最后一个成员到达时间计。 */
   albumDebounceMs: number;
   /** 瞬时错误的自动重试次数上限，超过后转为待处理。 */
@@ -114,11 +118,24 @@ export interface SavePlusOptions {
   albumProbeSpan: number;
   /** cleanup 时等待在途步骤结束的最长时间（毫秒）。 */
   stopTimeoutMs: number;
+  /** 读取来源历史的最小间隔（毫秒）与每分钟上限。 */
+  readMinIntervalMs: number;
+  readMaxPerMinute: number;
+  /** 整个历史备份：每页读取条数，以及单个备份允许同时排队的任务数上限。 */
+  backupPageSize: number;
+  backupBacklog: number;
+  /** 手动补漏读取时，单次可等待的最长限流时间（秒）；更长则提示稍后重试。 */
+  fillMaxFloodWaitSeconds: number;
+  /** 保存统计保留的天数。 */
+  statsRetentionDays: number;
 }
 
 export const DEFAULT_OPTIONS: SavePlusOptions = {
-  minIntervalMs: 2000,
+  // 固定 3 秒一条（每分钟 20 条），不随成功提速。
+  minIntervalMs: 3000,
   maxPerMinute: 20,
+  manualMinIntervalMs: 500,
+  manualMaxPerMinute: 120,
   albumDebounceMs: 1500,
   maxAttempts: 5,
   backoffBaseMs: 30_000,
@@ -129,6 +146,12 @@ export const DEFAULT_OPTIONS: SavePlusOptions = {
   diskMarginBytes: 64 * 1024 * 1024,
   albumProbeSpan: 20,
   stopTimeoutMs: 15_000,
+  readMinIntervalMs: 1000,
+  readMaxPerMinute: 30,
+  backupPageSize: 100,
+  backupBacklog: 30,
+  fillMaxFloodWaitSeconds: 300,
+  statsRetentionDays: 30,
 };
 
 export type ErrorCode =
@@ -212,7 +235,8 @@ class Mutex {
 
 export class RateLimiter {
   private sendTimes: number[] = [];
-  private lastSentAt: number | null = null;
+  /** 下一次允许发送的时间：上一次发送时间 + 间隔 × 上一次发送的消息条数。 */
+  private nextAllowedAt = 0;
   private cooldownUntil = 0;
   private readonly mutex = new Mutex();
   constructor(
@@ -230,25 +254,26 @@ export class RateLimiter {
     return Math.max(0, this.cooldownUntil - this.clock.now());
   }
 
-  acquire(signal?: AbortSignal): Promise<void> {
+  /** 获取发送配额；weight 为本次一次性发出的消息条数（相册按成员数计），间隔按条数累计。 */
+  acquire(signal?: AbortSignal, weight = 1): Promise<void> {
+    const count = Math.max(1, Math.floor(weight));
     return this.mutex.run(async () => {
       for (;;) {
         if (signal?.aborted) throw new SavePlusError("stopped", "插件正在停止");
         const now = this.clock.now();
         this.sendTimes = this.sendTimes.filter((t) => now - t < 60_000);
-        let wait = Math.max(0, this.cooldownUntil - now);
-        if (this.sendTimes.length >= this.maxPerMinute) {
-          wait = Math.max(wait, 60_000 - (now - this.sendTimes[0]));
-        }
-        if (this.lastSentAt !== null) {
-          wait = Math.max(wait, this.minIntervalMs - (now - this.lastSentAt));
+        let wait = Math.max(0, this.cooldownUntil - now, this.nextAllowedAt - now);
+        const need = Math.min(count, this.maxPerMinute);
+        if (this.sendTimes.length + need > this.maxPerMinute) {
+          const oldest = this.sendTimes[this.sendTimes.length + need - this.maxPerMinute - 1];
+          wait = Math.max(wait, 60_000 - (now - oldest));
         }
         if (wait <= 0) break;
         await this.clock.sleep(wait, signal);
       }
       const mark = this.clock.now();
-      this.sendTimes.push(mark);
-      this.lastSentAt = mark;
+      for (let i = 0; i < count; i++) this.sendTimes.push(mark);
+      this.nextAllowedAt = mark + this.minIntervalMs * count;
     });
   }
 }
@@ -261,10 +286,30 @@ export interface FilterConfig {
   types: MediaKind[] | "all";
   blacklist: string[];
   whitelist: { enabled: boolean; patterns: string[] };
+  /** 广告过滤：带内联按钮、隐藏链接或自定义表情刷屏的消息不保存（默认关闭）。 */
+  ads?: boolean;
 }
 
 export function defaultFilter(): FilterConfig {
-  return { types: "all", blacklist: [], whitelist: { enabled: false, patterns: [] } };
+  return { types: "all", blacklist: [], whitelist: { enabled: false, patterns: [] }, ads: false };
+}
+
+/** 自定义表情达到该数量视为刷屏广告。 */
+export const CUSTOM_EMOJI_AD_THRESHOLD = 5;
+
+/** 单条消息的广告特征（用于广告过滤）。 */
+export interface AdSignals {
+  hasButtons: boolean;
+  entities: EntityJson[];
+}
+
+/** 返回广告判定原因；不是广告时返回 null。判断内联按钮、隐藏链接与自定义表情刷屏。 */
+export function adReason(m: AdSignals): string | null {
+  if (m.hasButtons) return "包含内联按钮";
+  if (m.entities.some((en) => en.c === "MessageEntityTextUrl")) return "文案包含隐藏链接";
+  const emoji = m.entities.filter((en) => en.c === "MessageEntityCustomEmoji").length;
+  if (emoji >= CUSTOM_EMOJI_AD_THRESHOLD) return `自定义表情过多（${emoji} 个）`;
+  return null;
 }
 
 const REGEX_MAX_LENGTH = 300;
@@ -312,15 +357,37 @@ function safeRegexTest(pattern: string, text: string): boolean | "timeout" | "in
 
 export type FilterVerdict = { pass: true } | { pass: false; reason: string };
 
+/** 过滤判定所需的保存单位信息；ads 为各成员的广告特征。 */
+export interface FilterUnit {
+  kinds: MediaKind[];
+  text: string;
+  ads?: AdSignals[];
+}
+
+/** 由单条消息或整组相册构造过滤判定所需的信息。 */
+export function filterUnitOf(members: SourceMessage[]): FilterUnit {
+  return {
+    kinds: members.map((m) => m.kind),
+    text: members.map((m) => m.text).filter(Boolean).join("\n"),
+    ads: members.map((m) => ({ hasButtons: m.hasButtons, entities: m.entities })),
+  };
+}
+
 /**
  * 判定一个保存单位（单条消息或整组相册）是否通过监视过滤：
- * 类型符合 + 未命中黑名单 + （白名单关闭 或 至少命中一条）。
+ * 类型符合 + 未命中广告特征（开启时）+ 未命中黑名单 + （白名单关闭 或 至少命中一条）。
  */
-export function evaluateFilter(filter: FilterConfig, unit: { kinds: MediaKind[]; text: string }): FilterVerdict {
+export function evaluateFilter(filter: FilterConfig, unit: FilterUnit): FilterVerdict {
   if (filter.types !== "all") {
     const allowed = new Set(filter.types);
     const bad = unit.kinds.find((k) => !allowed.has(k));
     if (bad) return { pass: false, reason: `类型「${KIND_LABEL[bad]}」不在允许范围内` };
+  }
+  if (filter.ads) {
+    for (const sig of unit.ads ?? []) {
+      const reason = adReason(sig);
+      if (reason) return { pass: false, reason: `疑似广告：${reason}` };
+    }
   }
   const text = unit.text.slice(0, 16_384);
   const lower = text.toLowerCase();
@@ -352,7 +419,8 @@ function describeFilter(filter: FilterConfig): string {
   const wl = filter.whitelist.patterns.length
     ? filter.whitelist.patterns.map((p, i) => `${i + 1}. ${p}`).join("\n")
     : "（无）";
-  return `类型：${types}\n黑名单：${bl}\n白名单：${filter.whitelist.enabled ? "已启用" : "未启用"}\n${wl}`;
+  const ads = filter.ads ? `已开启（按钮、隐藏链接、自定义表情≥${CUSTOM_EMOJI_AD_THRESHOLD}）` : "关闭";
+  return `类型：${types}\n广告过滤：${ads}\n黑名单：${bl}\n白名单：${filter.whitelist.enabled ? "已启用" : "未启用"}\n${wl}`;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -378,7 +446,8 @@ export function parseMessageLink(raw: string): MessageLink | { error: string } |
   const segs = pathPart.split("/").filter(Boolean);
   if (segs[0] === "c") {
     if (segs.length < 3 || segs.length > 4) return { error: `无法识别的私有消息链接：${raw}` };
-    const internal = segs[1].replace(/^-?(100)?/, "");
+    // /c/ 链接中的是内部 ID；只去掉显式写出的 "-100" 标记，不能误删以 100 开头的真实 ID。
+    const internal = segs[1].replace(/^-100/, "");
     const id = Number(segs[segs.length - 1]);
     if (!/^\d+$/.test(internal) || !Number.isSafeInteger(id) || id <= 0) {
       return { error: `无法识别的私有消息链接：${raw}` };
@@ -427,7 +496,7 @@ export function parseTargetSpec(raw: string, currentChatId?: string): TargetSpec
   else {
     const m = /^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/(c\/)?([A-Za-z0-9_]+)\/?$/i.exec(base);
     if (!m) return { error: `无法识别的目标：${raw}` };
-    ref = m[1] ? `-100${m[2].replace(/^-?(100)?/, "")}` : `@${m[2]}`;
+    ref = m[1] ? `-100${m[2].replace(/^-100/, "")}` : `@${m[2]}`;
   }
   return { kind: "peer", ref, topicId };
 }
@@ -511,7 +580,31 @@ export interface PeerTarget {
   isSelf?: boolean;
 }
 
-export interface RuleRecord {
+/** 投递方式：本地中转（下载后重新上传，保留来源封面）或原生转发。 */
+export type DeliveryMode = "relay" | "forward";
+
+/** 规则的投递选项；缺省值由 deliveryOf 统一给出。 */
+export interface DeliveryOptions {
+  /** 投递方式，默认本地中转。 */
+  mode?: DeliveryMode;
+  /** 原生转发时隐藏“转发自”。 */
+  hideAuthor?: boolean;
+  /** 静音发送。 */
+  silent?: boolean;
+  /** 来源编辑后再保存一份新版（默认关闭）。 */
+  handleEdited?: boolean;
+}
+
+export function deliveryOf(o: DeliveryOptions): Required<DeliveryOptions> {
+  return {
+    mode: o.mode ?? "relay",
+    hideAuthor: Boolean(o.hideAuthor),
+    silent: Boolean(o.silent),
+    handleEdited: Boolean(o.handleEdited),
+  };
+}
+
+export interface RuleRecord extends DeliveryOptions {
   id: number;
   sourceChatId: string;
   sourceTitle: string;
@@ -520,6 +613,49 @@ export interface RuleRecord {
   filter: FilterConfig;
   createdAt: number;
   updatedAt: number;
+}
+
+/** 一次保存所依据的配置快照：来自监视规则或整个历史备份。 */
+export interface SaveSpec {
+  ruleId: number;
+  jobId?: number;
+  sourceChatId: string;
+  sourceTitle: string;
+  target: PeerTarget;
+  filter: FilterConfig;
+  mode: DeliveryMode;
+  hideAuthor: boolean;
+  silent: boolean;
+}
+
+export function specFromRule(r: RuleRecord): SaveSpec {
+  const { mode, hideAuthor, silent } = deliveryOf(r);
+  return { ruleId: r.id, sourceChatId: r.sourceChatId, sourceTitle: r.sourceTitle, target: r.target, filter: r.filter, mode, hideAuthor, silent };
+}
+
+export type BackupStatus = "running" | "paused" | "planned" | "cancelled" | "error";
+
+/** 整个历史备份：按页读取来源历史并为每个保存单位创建任务，游标持久化以便续传。 */
+export interface BackupJob {
+  id: number;
+  sourceChatId: string;
+  sourceTitle: string;
+  target: PeerTarget;
+  filter: FilterConfig;
+  /** 过滤来源：沿用该来源的监视规则，或不过滤。 */
+  filterFrom: "rule" | "none";
+  order: "asc" | "desc";
+  mode: DeliveryMode;
+  hideAuthor: boolean;
+  force: boolean;
+  status: BackupStatus;
+  /** 正序：已读到的最大消息 ID；倒序：下一页读取 ID 小于此值的消息（0 表示从最新开始）。 */
+  cursor: number;
+  counts: { scanned: number; queued: number; filtered: number; saved: number; claimed: number; attention: number; done: number };
+  createdAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  lastError?: { message: string; at: number };
 }
 
 export type TaskStatus =
@@ -608,8 +744,16 @@ export interface StagedItem {
 
 export interface TaskRecord {
   id: number;
-  kind: "monitor" | "backfill";
+  kind: "monitor" | "backfill" | "backup";
   ruleId: number;
+  jobId?: number;
+  mode?: DeliveryMode;
+  hideAuthor?: boolean;
+  silent?: boolean;
+  /** 来源编辑版本（编辑时间）；用于“编辑后再存一份”的去重。 */
+  editVersion?: number;
+  /** 原生转发被来源保护拒绝后，改为本地中转。 */
+  relayFallback?: boolean;
   accountId: string;
   sourceChatId: string;
   sourceTitle: string;
@@ -643,6 +787,7 @@ export interface SuccessRecord {
 export interface SkipRecord {
   at: number;
   ruleId: number;
+  jobId?: number;
   sourceChatId: string;
   messageIds: number[];
   reason: string;
@@ -659,6 +804,10 @@ export interface DbShape {
   successes: Record<string, SuccessRecord>;
   recentSkips: SkipRecord[];
   hold: { reason: string; at: number } | null;
+  /** 保存统计：日期 → 范围（rule:ID / backup:ID）→ 计数。 */
+  stats: Record<string, Record<string, { units: number; messages: number }>>;
+  backups: BackupJob[];
+  nextBackupId: number;
 }
 
 function emptyDb(): DbShape {
@@ -672,6 +821,9 @@ function emptyDb(): DbShape {
     successes: {},
     recentSkips: [],
     hold: null,
+    stats: {},
+    backups: [],
+    nextBackupId: 1,
   };
 }
 
@@ -684,6 +836,14 @@ function normalizeDb(raw: Partial<DbShape> | undefined): DbShape {
   d.successes = d.successes && typeof d.successes === "object" ? d.successes : {};
   d.recentSkips = Array.isArray(d.recentSkips) ? d.recentSkips : [];
   d.hold = d.hold ?? null;
+  d.stats = d.stats && typeof d.stats === "object" ? d.stats : {};
+  d.backups = Array.isArray(d.backups) ? d.backups : [];
+  d.nextBackupId = Math.max(d.nextBackupId || 1, ...d.backups.map((b) => b.id + 1), 1);
+  for (const b of d.backups) {
+    if (typeof b.counts.done !== "number") {
+      b.counts.done = d.tasks.filter((t) => t.jobId === b.id && t.status === "done").length;
+    }
+  }
   d.nextRuleId = Math.max(d.nextRuleId || 1, ...d.rules.map((r) => r.id + 1), 1);
   d.nextTaskId = Math.max(d.nextTaskId || 1, ...d.tasks.map((t) => t.id + 1), 1);
   for (const r of d.rules) {
@@ -768,6 +928,8 @@ export interface SourceMessage {
   chatId: string;
   id: number;
   date: number;
+  /** 最后一次编辑时间（未编辑为 undefined）。 */
+  editDate?: number;
   out: boolean;
   groupedId?: string;
   kind: MediaKind;
@@ -783,6 +945,8 @@ export interface SourceMessage {
   unsupportedReason?: string;
   webPreview: boolean;
   noforwards: boolean;
+  /** 消息带按钮（用于广告过滤）。 */
+  hasButtons: boolean;
   raw: unknown;
 }
 
@@ -808,14 +972,22 @@ export interface TelegramPort {
     target: PeerTarget,
     sourceChatId: string,
     ids: number[],
-    opts?: { dropAuthor?: boolean }
+    opts?: { dropAuthor?: boolean; silent?: boolean }
   ): Promise<number[]>;
   sendText(
     target: PeerTarget,
     text: string,
     entities: EntityJson[],
-    opts?: { html?: boolean; replyTo?: number; linkPreview?: boolean }
+    opts?: { html?: boolean; replyTo?: number; linkPreview?: boolean; silent?: boolean }
   ): Promise<number>;
+  /**
+   * 按方向读取一页来源历史（含系统消息）。正序返回 ID 大于 afterId 的消息，倒序返回 ID 小于 beforeId 的消息
+   * （beforeId 为 0 表示从最新开始）。rawIds 为本页全部原始消息（含系统消息）按读取顺序的 ID，为空表示没有更多消息。
+   */
+  getHistory(
+    chatId: string,
+    opts: { ascending: boolean; afterId?: number; beforeId?: number; limit: number }
+  ): Promise<{ messages: SourceMessage[]; rawIds: number[] }>;
   /** 下载媒体（及封面／缩略图）到 dir，返回可持久化的中转清单项。 */
   stageMedia(message: SourceMessage, dir: string, signal?: AbortSignal): Promise<StagedItem>;
   /** 上传并发送中转内容；单条或整组相册，返回逐项确认的目标消息 ID。 */
@@ -1155,6 +1327,7 @@ export class TeleprotoPort implements TelegramPort {
       chatId,
       id: m.id,
       date: m.date,
+      editDate: m.editDate || undefined,
       out: Boolean(m.out),
       groupedId: m.groupedId ? m.groupedId.toString() : undefined,
       kind: "text",
@@ -1163,6 +1336,7 @@ export class TeleprotoPort implements TelegramPort {
       reuploadable: true,
       webPreview: false,
       noforwards: Boolean(m.noforwards),
+      hasButtons: Boolean(m.replyMarkup),
       raw: m,
     };
     const media = m.media;
@@ -1243,7 +1417,7 @@ export class TeleprotoPort implements TelegramPort {
     target: PeerTarget,
     sourceChatId: string,
     ids: number[],
-    opts: { dropAuthor?: boolean } = {}
+    opts: { dropAuthor?: boolean; silent?: boolean } = {}
   ): Promise<number[]> {
     const to = await this.entity(target.peerId);
     const from = await this.entity(sourceChatId);
@@ -1252,6 +1426,7 @@ export class TeleprotoPort implements TelegramPort {
         messages: ids,
         fromPeer: from as never,
         dropAuthor: opts.dropAuthor,
+        silent: opts.silent,
         topMsgId: target.topicId,
       });
       const outIds = (res || []).filter(Boolean).map((m) => m.id);
@@ -1268,7 +1443,7 @@ export class TeleprotoPort implements TelegramPort {
     target: PeerTarget,
     text: string,
     entities: EntityJson[],
-    opts: { html?: boolean; replyTo?: number; linkPreview?: boolean } = {}
+    opts: { html?: boolean; replyTo?: number; linkPreview?: boolean; silent?: boolean } = {}
   ): Promise<number> {
     const to = await this.entity(target.peerId);
     try {
@@ -1278,6 +1453,7 @@ export class TeleprotoPort implements TelegramPort {
         formattingEntities: opts.html ? undefined : entitiesFromJson(entities),
         linkPreview: opts.linkPreview ?? true,
         replyTo: this.replyFor(target, opts.replyTo),
+        silent: opts.silent,
       });
       if (!sent || typeof sent.id !== "number") {
         throw new SavePlusError("uncertain", "发送结果缺少消息 ID", { maybeSent: true });
@@ -1493,7 +1669,10 @@ export class TeleprotoPort implements TelegramPort {
     }
     const replyTo = this.replyFor(target);
     if (items.length === 1 && !items[0].mediaFile) {
-      const id = await this.sendText(target, items[0].text, items[0].entities, { linkPreview: Boolean(items[0].webPreview) });
+      const id = await this.sendText(target, items[0].text, items[0].entities, {
+        linkPreview: Boolean(items[0].webPreview),
+        silent: opts.silent,
+      });
       return { messageIds: [id], warnings: [] };
     }
     if (items.some((it) => !it.mediaFile)) {
@@ -1568,6 +1747,29 @@ export class TeleprotoPort implements TelegramPort {
     return { messageIds: ids, warnings: this.verifyCovers(items, ids, messages) };
   }
 
+  async getHistory(
+    chatId: string,
+    opts: { ascending: boolean; afterId?: number; beforeId?: number; limit: number }
+  ): Promise<{ messages: SourceMessage[]; rawIds: number[] }> {
+    const entity = await this.entity(chatId);
+    let list: unknown[];
+    try {
+      list = await this.client.getMessages(
+        entity as never,
+        opts.ascending
+          ? { limit: opts.limit, reverse: true, offsetId: opts.afterId ?? 0 }
+          : { limit: opts.limit, offsetId: opts.beforeId ?? 0 }
+      );
+    } catch (e) {
+      throw classifyError(e, "read");
+    }
+    const raw = list.filter((m) => m && typeof (m as { id?: unknown }).id === "number") as Array<{ id: number }>;
+    const messages = raw
+      .map((m) => this.toSourceMessage(m))
+      .filter((m): m is SourceMessage => Boolean(m));
+    return { messages, rawIds: raw.map((m) => m.id) };
+  }
+
   async findRecentOwn(target: PeerTarget, sinceUnix: number, limit: number): Promise<SourceMessage[]> {
     const entity = await this.entity(target.peerId);
     let list: unknown[];
@@ -1593,6 +1795,8 @@ export interface EngineDirs {
   manual: string;
   /** 纯本地归档目录（永久保留，不受中转清理影响）。 */
   archive: string;
+  /** 插件持久数据目录（assets/saveplus）。 */
+  data: string;
 }
 
 export interface EngineDeps {
@@ -1620,6 +1824,8 @@ interface AlbumBuffer {
   groupedId: string;
   members: Map<number, SourceMessage>;
   version: number;
+  /** 编辑事件聚合时为最大编辑时间。 */
+  editVersion?: number;
 }
 
 async function defaultDiskFree(dir: string): Promise<number | undefined> {
@@ -1631,8 +1837,22 @@ async function defaultDiskFree(dir: string): Promise<number | undefined> {
   }
 }
 
-export function successKey(accountId: string, chatId: string, messageId: number, target: PeerTarget): string {
-  return `${accountId}|${chatId}|${messageId}|${target.peerId}${target.topicId ? `#${target.topicId}` : ""}`;
+export function successKey(
+  accountId: string,
+  chatId: string,
+  messageId: number,
+  target: PeerTarget,
+  editVersion?: number
+): string {
+  return `${accountId}|${chatId}|${messageId}|${target.peerId}${target.topicId ? `#${target.topicId}` : ""}${
+    editVersion ? `@e${editVersion}` : ""
+  }`;
+}
+
+/** 本地日期（YYYY-MM-DD），用于保存统计。 */
+export function dayKey(ms: number): string {
+  const d = new Date(ms);
+  return new Date(ms - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
 }
 
 function targetLabel(t: PeerTarget): string {
@@ -1642,6 +1862,13 @@ function targetLabel(t: PeerTarget): string {
 export class Engine {
   accountId = "";
   readonly limiter: RateLimiter;
+  /** 读取来源历史的独立限速（不占用发送配额）。 */
+  readonly readLimiter: RateLimiter;
+  /** 普通手动保存的独立发送限速。 */
+  readonly manualLimiter: RateLimiter;
+  private planner: Promise<void> | null = null;
+  private plannerWake: (() => void) | null = null;
+  private plannerWaiting = false;
   private stopped = false;
   private started = false;
   private readonly abort = new AbortController();
@@ -1661,6 +1888,8 @@ export class Engine {
 
   constructor(readonly deps: EngineDeps) {
     this.limiter = new RateLimiter(deps.clock, deps.options.minIntervalMs, deps.options.maxPerMinute);
+    this.readLimiter = new RateLimiter(deps.clock, deps.options.readMinIntervalMs, deps.options.readMaxPerMinute);
+    this.manualLimiter = new RateLimiter(deps.clock, deps.options.manualMinIntervalMs, deps.options.manualMaxPerMinute);
     this.diskFree = deps.diskFree ?? defaultDiskFree;
   }
 
@@ -1709,7 +1938,9 @@ export class Engine {
       }
     });
     await this.cleanupManualTemp();
+    await this.sweepStaging();
     this.loop = this.runLoop();
+    this.planner = this.runPlanner();
   }
 
   /** 停止接收与执行：先把尚在聚合的相册落盘为任务，再等待在途步骤结束，最后关闭存储。 */
@@ -1721,10 +1952,11 @@ export class Engine {
     this.stopped = true;
     this.abort.abort();
     this.wake?.();
+    this.plannerWake?.();
     if (this.loop) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
-        this.loop.catch(() => undefined),
+        Promise.all([this.loop.catch(() => undefined), this.planner?.catch(() => undefined)]),
         new Promise<void>((r) => {
           timer = setTimeout(r, this.options.stopTimeoutMs);
         }),
@@ -1738,7 +1970,8 @@ export class Engine {
   /** 交给宿主跟踪的执行任务：循环结束或 stop() 完成（含超时放弃）即结算，挂起的网络请求不阻塞重载。 */
   get loopPromise(): Promise<void> | null {
     if (!this.loop) return null;
-    return Promise.race([this.loop.catch(() => undefined), this.stoppedPromise]);
+    const both = Promise.all([this.loop.catch(() => undefined), this.planner?.catch(() => undefined)]).then(() => undefined);
+    return Promise.race([both, this.stoppedPromise]);
   }
 
   private notify(): void {
@@ -1754,7 +1987,11 @@ export class Engine {
       const scheduled = this.store.isClosed
         ? false
         : this.store.data.tasks.some((t) => t.status === "retry_wait" || (t.status === "cleanup_pending" && t.nextAttemptAt !== undefined && (t.cleanupAttempts ?? 0) < 10));
-      if (!this.busy && this.intake === 0 && this.albums.size === 0 && !due && !(scheduled && !this.store.data.hold)) return;
+      const planning =
+        !this.store.isClosed && !this.plannerWaiting && this.store.data.backups.some((b) => b.status === "running");
+      if (!this.busy && this.intake === 0 && this.albums.size === 0 && !due && !planning && !(scheduled && !this.store.data.hold)) {
+        return;
+      }
       if (Date.now() > deadline) throw new Error("whenIdle timeout");
     }
   }
@@ -1771,8 +2008,12 @@ export class Engine {
     if (this.inflightTargets.has(m.chatId)) return true;
     const exp = this.ownSent.get(`${m.chatId}:${m.id}`);
     if (exp !== undefined && exp > now) return true;
-    const prefixes = safePrefixes();
-    return prefixes.some((p) => m.text.startsWith(p) && /^[a-z0-9_]/i.test(m.text.slice(p.length)));
+    // 只忽略本插件的命令消息；以前缀字符开头的普通帖子（如 “.NET 9 发布”）照常处理。
+    const text = m.text.toLowerCase();
+    return safePrefixes().some((p) => {
+      const head = `${p}${PLUGIN_NAME}`.toLowerCase();
+      return text.startsWith(head) && (text.length === head.length || /\s/.test(text[head.length]));
+    });
   }
 
   /** 在向某会话发送期间标记“发送中”，并登记发出的消息，防止目标同时是监视来源时回声中转。 */
@@ -1798,25 +2039,29 @@ export class Engine {
     }
   }
 
-  /** 宿主 listenMessageHandler 的入口：只处理新消息；编辑事件直接忽略。 */
+  /** 宿主 listenMessageHandler 的入口：处理新消息；编辑事件仅在规则开启“编辑后再存一份”时处理。 */
   async onMessage(raw: unknown, options?: { isEdited?: boolean }): Promise<void> {
-    if (this.stopped || !this.started || options?.isEdited) return;
+    if (this.stopped || !this.started) return;
+    const edited = Boolean(options?.isEdited);
     if (this.port.chatIdOf) {
       const quick = this.port.chatIdOf(raw);
-      if (!quick || !this.ruleForChat(quick)?.enabled) return;
+      const r = quick ? this.ruleForChat(quick) : undefined;
+      if (!r?.enabled || (edited && !r.handleEdited)) return;
     }
     const msg = this.port.toSourceMessage(raw);
     if (!msg) return;
     const rule = this.ruleForChat(msg.chatId);
     if (!rule || !rule.enabled) return;
+    if (edited && (!rule.handleEdited || !msg.editDate)) return;
     if (this.isOwnEcho(msg)) return;
+    const editVersion = edited ? msg.editDate : undefined;
     if (msg.groupedId) {
-      this.bufferAlbum(rule, msg);
+      this.bufferAlbum(rule, msg, editVersion);
       return;
     }
     this.intake++;
     try {
-      await this.admitUnit(rule, [msg], { kind: "monitor" });
+      await this.admitUnit(specFromRule(rule), [msg], { kind: "monitor", editVersion });
     } catch (e) {
       this.log(`处理来源消息 ${msg.chatId}/${msg.id} 失败`, e);
     } finally {
@@ -1824,11 +2069,11 @@ export class Engine {
     }
   }
 
-  private bufferAlbum(rule: RuleRecord, msg: SourceMessage): void {
-    const key = `${msg.chatId}:${msg.groupedId}`;
+  private bufferAlbum(rule: RuleRecord, msg: SourceMessage, editVersion?: number): void {
+    const key = `${msg.chatId}:${msg.groupedId}${editVersion ? ":edit" : ""}`;
     let buf = this.albums.get(key);
     if (!buf) {
-      if (this.flushedAlbums.has(key)) {
+      if (!editVersion && this.flushedAlbums.has(key)) {
         this.intake++;
         this.admitLateMember(rule, key, msg)
           .catch((e) => this.log(`处理迟到的相册成员 ${msg.id} 失败`, e))
@@ -1839,7 +2084,8 @@ export class Engine {
       this.albums.set(key, buf);
       void this.albumTimer(buf);
     }
-    if (buf.members.has(msg.id)) return;
+    if (editVersion) buf.editVersion = Math.max(buf.editVersion ?? 0, editVersion);
+    if (buf.members.has(msg.id) && !editVersion) return;
     buf.members.set(msg.id, msg);
     buf.version++;
   }
@@ -1863,7 +2109,12 @@ export class Engine {
       const rule = this.store.data.rules.find((r) => r.id === buf.ruleId && r.enabled);
       if (!rule) return;
       const members = Array.from(buf.members.values()).sort((a, b) => a.id - b.id);
-      const res = await this.admitUnit(rule, members, { kind: "monitor", groupedId: buf.groupedId });
+      const res = await this.admitUnit(specFromRule(rule), members, {
+        kind: "monitor",
+        groupedId: buf.groupedId,
+        editVersion: buf.editVersion,
+      });
+      if (buf.editVersion) return;
       this.flushedAlbums.set(key, res.taskId ?? 0);
       if (this.flushedAlbums.size > 2000) {
         const first = this.flushedAlbums.keys().next().value;
@@ -1894,10 +2145,10 @@ export class Engine {
     }
     if (merged === "none") {
       // 原相册未形成任务（被过滤或已保存），单独按整组语义处理该成员。
-      await this.admitUnit(rule, [msg], { kind: "monitor", groupedId: msg.groupedId });
+      await this.admitUnit(specFromRule(rule), [msg], { kind: "monitor", groupedId: msg.groupedId });
       return;
     }
-    await this.admitUnit(rule, [msg], {
+    await this.admitUnit(specFromRule(rule), [msg], {
       kind: "monitor",
       groupedId: msg.groupedId,
       attention: { code: "late_album_member", message: `相册成员 ${msg.id} 在整组提交发送后才到达，未自动补发` },
@@ -1906,32 +2157,30 @@ export class Engine {
 
   /**
    * 为一个保存单位创建持久任务：过滤 → 成功记录去重 → 在途协调 → 入队。
-   * 在线监视与手动补漏共用此路径。
+   * 在线监视、手动补漏与整个历史备份共用此路径。
    */
   async admitUnit(
-    rule: RuleRecord,
+    spec: SaveSpec,
     members: SourceMessage[],
     opts: {
-      kind: "monitor" | "backfill";
+      kind: "monitor" | "backfill" | "backup";
       groupedId?: string;
       force?: boolean;
+      editVersion?: number;
       attention?: { code: string; message: string };
     }
   ): Promise<AdmitResult> {
-    const unit = {
-      kinds: members.map((m) => m.kind),
-      text: members.map((m) => m.text).filter(Boolean).join("\n"),
-    };
-    const verdict = evaluateFilter(rule.filter, unit);
+    const rule = spec;
+    const verdict = evaluateFilter(spec.filter, filterUnitOf(members));
     const ids = members.map((m) => m.id);
     const now = this.clock.now();
     if (!verdict.pass) {
-      await this.recordSkip(rule, members[0].chatId, ids, verdict.reason);
+      await this.recordSkip(spec, members[0].chatId, ids, verdict.reason);
       return { outcome: "skipped", category: "filtered", reason: verdict.reason };
     }
     const accountId = this.accountId;
     const result = await this.store.update((d): AdmitResult => {
-      const keys = ids.map((id) => successKey(accountId, rule.sourceChatId, id, rule.target));
+      const keys = ids.map((id) => successKey(accountId, rule.sourceChatId, id, rule.target, opts.editVersion));
       const saved = keys.filter((k) => d.successes[k]);
       if (!opts.force && saved.length === keys.length) {
         return { outcome: "skipped", category: "saved", reason: "已成功保存到该目标" };
@@ -1950,7 +2199,12 @@ export class Engine {
       const task: TaskRecord = {
         id: d.nextTaskId++,
         kind: opts.kind,
-        ruleId: rule.id,
+        ruleId: spec.ruleId,
+        jobId: spec.jobId,
+        mode: spec.mode,
+        hideAuthor: spec.hideAuthor || undefined,
+        silent: spec.silent || undefined,
+        editVersion: opts.editVersion,
         accountId,
         sourceChatId: rule.sourceChatId,
         sourceTitle: rule.sourceTitle,
@@ -1976,7 +2230,7 @@ export class Engine {
       };
     });
     if (result.outcome === "skipped") {
-      await this.recordSkip(rule, rule.sourceChatId, ids, result.reason || "已跳过").catch(() => undefined);
+      await this.recordSkip(spec, rule.sourceChatId, ids, result.reason || "已跳过").catch(() => undefined);
     }
     if (result.outcome === "queued") this.notify();
     return result;
@@ -1987,26 +2241,56 @@ export class Engine {
     return d.tasks.find(
       (t) =>
         CLAIMING_STATUSES.has(t.status) &&
-        t.memberIds.some((id) => wanted.has(successKey(t.accountId, t.sourceChatId, id, t.target)))
+        t.memberIds.some((id) => wanted.has(successKey(t.accountId, t.sourceChatId, id, t.target, t.editVersion)))
     );
   }
 
-  private async recordSkip(rule: RuleRecord, chatId: string, ids: number[], reason: string): Promise<void> {
+  private async recordSkip(spec: SaveSpec, chatId: string, ids: number[], reason: string): Promise<void> {
     if (this.store.isClosed) return;
     await this.store.update((d) => {
-      d.recentSkips.unshift({ at: this.clock.now(), ruleId: rule.id, sourceChatId: chatId, messageIds: ids, reason });
+      d.recentSkips.unshift({
+        at: this.clock.now(),
+        ruleId: spec.ruleId,
+        jobId: spec.jobId,
+        sourceChatId: chatId,
+        messageIds: ids,
+        reason,
+      });
       d.recentSkips.length = Math.min(d.recentSkips.length, 50);
     });
   }
 
   // ── 后台执行 ──────────────────────────────────────────────────────────────
 
+  /** 限流针对整个账号：后台任务与手动保存一起冷却。 */
+  applyFloodCooldown(ms: number): void {
+    this.limiter.applyCooldown(ms);
+    this.manualLimiter.applyCooldown(ms);
+  }
+
+  get cooldownRemainingMs(): number {
+    return Math.max(this.limiter.cooldownRemainingMs, this.manualLimiter.cooldownRemainingMs);
+  }
+
+  /** 正在等待限流结束的最早任务 ID：限流针对整个账号，排在它之后的任务也等待，以保持发送顺序。 */
+  private floodBarrier(now: number): number | undefined {
+    let barrier: number | undefined;
+    for (const t of this.store.data.tasks) {
+      if (t.status === "retry_wait" && t.lastError?.code === "flood" && (t.nextAttemptAt ?? 0) > now) {
+        barrier = barrier === undefined ? t.id : Math.min(barrier, t.id);
+      }
+    }
+    return barrier;
+  }
+
   private pickNext(now: number): TaskRecord | undefined {
     if (this.store.isClosed) return undefined;
     const d = this.store.data;
     const held = Boolean(d.hold);
+    const barrier = this.floodBarrier(now);
     let best: TaskRecord | undefined;
     for (const t of d.tasks) {
+      if (barrier !== undefined && t.id > barrier && t.status !== "cleanup_pending") continue;
       const runnable =
         (!held && t.status === "queued") ||
         (!held && t.status === "retry_wait" && (t.nextAttemptAt ?? 0) <= now) ||
@@ -2055,6 +2339,7 @@ export class Engine {
         this.log(`任务 #${task.id} 处理异常`, e);
       } finally {
         this.busy = false;
+        this.plannerWake?.();
       }
     }
   }
@@ -2105,19 +2390,21 @@ export class Engine {
     }
     const signal = this.abort.signal;
     try {
-      await this.mutate(t, (x) => {
-        x.status = "running";
-        x.stagingDir = x.stagingDir ?? this.stagingDirFor(x);
+      // 原子地认领任务：期间若已被取消或改变状态，则不执行。
+      const claimed = await this.store.update(() => {
+        if (t.status !== "queued" && t.status !== "retry_wait") return false;
+        t.status = "running";
+        t.stagingDir = t.stagingDir ?? this.stagingDirFor(t);
+        t.updatedAt = this.clock.now();
+        return true;
       });
+      if (!claimed) return;
       const before = t.memberIds.length;
       const fresh = await this.port.getMessages(t.sourceChatId, t.memberIds);
       const grown = await this.discoverAlbumMembers(t, fresh);
       if (grown || before !== t.memberIds.length) {
         const all = t.memberIds.map((id) => fresh.get(id)).filter((m): m is SourceMessage => Boolean(m));
-        const verdict = evaluateFilter(t.filter, {
-          kinds: all.map((m) => m.kind),
-          text: all.map((m) => m.text).filter(Boolean).join("\n"),
-        });
+        const verdict = evaluateFilter(t.filter, filterUnitOf(all));
         if (!verdict.pass) {
           await this.finishSkipped(t, `补全相册成员后不再满足过滤条件：${verdict.reason}`);
           return;
@@ -2125,7 +2412,7 @@ export class Engine {
       }
       // 再次核对成功记录（可能已由其他路径完成）。
       if (!t.force) {
-        const keys = t.memberIds.map((id) => successKey(t.accountId, t.sourceChatId, id, t.target));
+        const keys = t.memberIds.map((id) => successKey(t.accountId, t.sourceChatId, id, t.target, t.editVersion));
         const saved = keys.filter((k) => this.store.data.successes[k]);
         if (saved.length === keys.length) {
           await this.finishSkipped(t, "已成功保存到该目标");
@@ -2134,6 +2421,39 @@ export class Engine {
         if (saved.length > 0) {
           throw new SavePlusError("invalid", `相册中 ${saved.length}/${keys.length} 条已保存过，需要显式整组强制重存`);
         }
+      }
+      const notes: string[] = [];
+      if ((t.mode ?? "relay") === "forward" && !t.relayFallback) {
+        // 原生转发：不下载；来源受保护时自动改为本地中转。
+        const missing = t.memberIds.find((id) => !fresh.has(id));
+        if (missing !== undefined) throw new SavePlusError("not_found", `来源消息 ${missing} 已不存在或无法读取`);
+        const restricted = t.memberIds.some((id) => fresh.get(id)?.noforwards);
+        if (!restricted) {
+          await this.limiter.acquire(signal, t.memberIds.length);
+          if (this.stopped) throw new SavePlusError("stopped", "插件正在停止");
+          await this.mutate(t, (x) => {
+            x.status = "sending";
+            x.sendStartedAt = this.clock.now();
+          });
+          try {
+            const ids = await this.withInflight(
+              t.target,
+              () => this.port.forwardMessages(t.target, t.sourceChatId, t.memberIds, { dropAuthor: t.hideAuthor, silent: t.silent }),
+              (r) => r
+            );
+            await this.confirmSuccess(t, ids, "response");
+            await this.cleanupTask(t);
+            return;
+          } catch (err) {
+            const c = classifyError(err, "send");
+            if (c.code !== "forward_restricted") throw c;
+          }
+        }
+        notes.push("来源禁止转发，已改为本地中转");
+        await this.mutate(t, (x) => {
+          x.relayFallback = true;
+          x.status = "running";
+        });
       }
       const items: StagedItem[] = [];
       for (const id of t.memberIds) {
@@ -2169,7 +2489,7 @@ export class Engine {
           );
         }
       }
-      await this.limiter.acquire(signal);
+      await this.limiter.acquire(signal, items.length);
       if (this.stopped) throw new SavePlusError("stopped", "插件正在停止");
       await this.mutate(t, (x) => {
         x.status = "sending";
@@ -2177,10 +2497,10 @@ export class Engine {
       });
       const sent = await this.withInflight(
         t.target,
-        () => this.port.sendStaged(t.target, items, { topicId: t.target.topicId }),
+        () => this.port.sendStaged(t.target, items, { topicId: t.target.topicId, silent: t.silent }),
         (r) => r.messageIds
       );
-      await this.confirmSuccess(t, sent.messageIds, "response", sent.warnings);
+      await this.confirmSuccess(t, sent.messageIds, "response", [...notes, ...sent.warnings]);
       await this.cleanupTask(t);
     } catch (e) {
       await this.handleFailure(t, e);
@@ -2198,12 +2518,24 @@ export class Engine {
     const now = this.clock.now();
     await this.store.update((d) => {
       t.memberIds.forEach((id, i) => {
-        d.successes[successKey(t.accountId, t.sourceChatId, id, t.target)] = {
+        d.successes[successKey(t.accountId, t.sourceChatId, id, t.target, t.editVersion)] = {
           taskId: t.id,
           targetMessageId: messageIds[i],
           at: now,
         };
       });
+      if (t.jobId) {
+        const job = d.backups.find((b) => b.id === t.jobId);
+        if (job) job.counts.done += 1;
+      }
+      const day = dayKey(now);
+      const scope = t.jobId ? `backup:${t.jobId}` : `rule:${t.ruleId}`;
+      const bucket = (d.stats[day] ??= {});
+      const counter = (bucket[scope] ??= { units: 0, messages: 0 });
+      counter.units += 1;
+      counter.messages += t.memberIds.length;
+      const oldest = dayKey(now - this.options.statsRetentionDays * 86_400_000);
+      for (const k of Object.keys(d.stats)) if (k < oldest) delete d.stats[k];
       t.status = "cleanup_pending";
       t.result = { messageIds, confirmedAt: now, via };
       t.warnings = warnings.length ? warnings : undefined;
@@ -2213,18 +2545,22 @@ export class Engine {
     });
   }
 
+  /** 返回属于该任务、位于中转根目录内的中转目录；记录被篡改时拒绝。 */
+  private ownedStagingDir(t: TaskRecord): string | undefined {
+    const dir = t.stagingDir;
+    if (!dir) return undefined;
+    if (!isInside(this.deps.dirs.staging, dir) || path.basename(dir) !== `task_${t.id}`) {
+      throw new SavePlusError("internal", `拒绝清理不属于任务的目录：${dir}`);
+    }
+    return dir;
+  }
+
   /** 仅删除属于该任务、位于中转根目录内的文件；成功记录已持久化后才执行。 */
   private async cleanupTask(t: TaskRecord): Promise<void> {
     try {
       await this.store.flush();
-      const dir = t.stagingDir;
-      if (dir) {
-        const root = this.deps.dirs.staging;
-        if (!isInside(root, dir) || path.basename(dir) !== `task_${t.id}`) {
-          throw new SavePlusError("internal", `拒绝清理不属于任务的目录：${dir}`);
-        }
-        await fsp.rm(dir, { recursive: true, force: true });
-      }
+      const dir = this.ownedStagingDir(t);
+      if (dir) await fsp.rm(dir, { recursive: true, force: true });
       await this.mutate(t, (x) => {
         x.status = "done";
         x.staged = undefined;
@@ -2255,10 +2591,32 @@ export class Engine {
   }
 
   private async removeStaging(t: TaskRecord): Promise<void> {
-    const dir = t.stagingDir;
-    if (dir && isInside(this.deps.dirs.staging, dir) && path.basename(dir) === `task_${t.id}`) {
-      await fsp.rm(dir, { recursive: true, force: true });
+    const dir = this.ownedStagingDir(t);
+    if (dir) await fsp.rm(dir, { recursive: true, force: true });
+  }
+
+  /**
+   * 清扫中转根目录：删除没有任务记录或任务已结束的 task_* 目录（例如崩溃残留、已被裁剪的任务）。
+   * 未结束任务（含待处理、结果不确定）的中转文件保留，供重试或核对。
+   */
+  async sweepStaging(): Promise<number> {
+    const root = this.deps.dirs.staging;
+    const keep = new Set(
+      this.store.data.tasks.filter((t) => !FINISHED_STATUSES.has(t.status)).map((t) => `task_${t.id}`)
+    );
+    let removed = 0;
+    let names: string[];
+    try {
+      names = await fsp.readdir(root);
+    } catch {
+      return 0;
     }
+    for (const name of names) {
+      if (!/^task_\d+$/.test(name) || keep.has(name)) continue;
+      await fsp.rm(path.join(root, name), { recursive: true, force: true }).catch(() => undefined);
+      removed++;
+    }
+    return removed;
   }
 
   private async handleFailure(t: TaskRecord, e: unknown): Promise<void> {
@@ -2286,7 +2644,7 @@ export class Engine {
       switch (err.code) {
         case "flood": {
           const waitMs = ((err.seconds ?? 1) + 1) * 1000;
-          this.limiter.applyCooldown(waitMs);
+          this.applyFloodCooldown(waitMs);
           x.floodWaits += 1;
           if (x.floodWaits > this.options.maxFloodWaits) {
             x.status = "needs_attention";
@@ -2337,6 +2695,7 @@ export class Engine {
     await this.store.update((d) => {
       d.tasks = d.tasks.filter((t) => !drop.has(t.id));
     });
+    await this.sweepStaging();
   }
 
   private async cleanupManualTemp(): Promise<void> {
@@ -2347,6 +2706,260 @@ export class Engine {
     } catch {
       /* ignore */
     }
+  }
+
+  // ── 读取来源历史（独立限速，识别长时间限流） ─────────────────────────────
+
+  /**
+   * 带读取限速执行一次读取；遇到限流按服务端秒数冷却后重试同一请求。
+   * maxWaitSeconds 限制单次可接受的等待时间，超过时报错（不静默放弃）。
+   */
+  async readWithRetry<T>(fn: () => Promise<T>, opts: { maxWaitSeconds?: number; onWait?: (seconds: number) => Promise<void> } = {}): Promise<T> {
+    let transient = 0;
+    for (;;) {
+      await this.readLimiter.acquire(this.abort.signal);
+      try {
+        return await fn();
+      } catch (e) {
+        const c = classifyError(e, "read");
+        if (c.code === "flood") {
+          const seconds = c.seconds ?? 1;
+          if (opts.maxWaitSeconds !== undefined && seconds > opts.maxWaitSeconds) {
+            throw new SavePlusError("flood", `读取被 Telegram 限流 ${seconds} 秒，请稍后再试`, { transient: true, seconds });
+          }
+          await opts.onWait?.(seconds);
+          this.readLimiter.applyCooldown((seconds + 1) * 1000);
+          continue;
+        }
+        if (c.transient && c.code !== "stopped" && transient < 3) {
+          transient++;
+          await this.clock.sleep(2000 * transient, this.abort.signal);
+          if (this.abort.signal.aborted) throw new SavePlusError("stopped", "插件正在停止");
+          continue;
+        }
+        throw c;
+      }
+    }
+  }
+
+  /** 按 100 条一组、受读取限速地读取指定消息。 */
+  async readMessages(chatId: string, ids: number[], opts: { maxWaitSeconds?: number } = {}): Promise<Map<number, SourceMessage>> {
+    const out = new Map<number, SourceMessage>();
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const got = await this.readWithRetry(() => this.port.getMessages(chatId, chunk), opts);
+      for (const [id, m] of got) out.set(id, m);
+    }
+    return out;
+  }
+
+  // ── 整个历史备份 ──────────────────────────────────────────────────────────
+
+  private specFromJob(job: BackupJob): SaveSpec {
+    return {
+      ruleId: 0,
+      jobId: job.id,
+      sourceChatId: job.sourceChatId,
+      sourceTitle: job.sourceTitle,
+      target: job.target,
+      filter: job.filter,
+      mode: job.mode,
+      hideAuthor: job.hideAuthor,
+      silent: false,
+    };
+  }
+
+  /** 该备份尚在执行队列中的任务数（不含待处理），用于限制排队规模。 */
+  backupBacklog(jobId: number): number {
+    return this.store.data.tasks.filter(
+      (t) =>
+        t.jobId === jobId &&
+        (t.status === "queued" || t.status === "running" || t.status === "sending" || t.status === "retry_wait")
+    ).length;
+  }
+
+  private async runPlanner(): Promise<void> {
+    while (!this.stopped) {
+      const job = this.store.isClosed ? undefined : this.store.data.backups.find((b) => b.status === "running");
+      if (!job || this.backupBacklog(job.id) >= this.options.backupBacklog || this.store.data.hold) {
+        this.plannerWaiting = true;
+        await new Promise<void>((resolve) => {
+          this.plannerWake = () => {
+            this.plannerWake = null;
+            resolve();
+          };
+        });
+        this.plannerWaiting = false;
+        continue;
+      }
+      try {
+        await this.planBackupPage(job);
+      } catch (e) {
+        const c = classifyError(e, "read");
+        if (c.code === "stopped" || this.store.isClosed) return;
+        await this.store
+          .update(() => {
+            job.status = "error";
+            job.lastError = { message: c.message, at: this.clock.now() };
+            job.updatedAt = this.clock.now();
+          })
+          .catch(() => undefined);
+      }
+    }
+  }
+
+  /** 读取一页历史并按保存单位入队；跨页的相册会退回游标，在下一页整组读取。 */
+  private async planBackupPage(job: BackupJob): Promise<void> {
+    const ascending = job.order === "asc";
+    const limit = this.options.backupPageSize;
+    const page = await this.readWithRetry(
+      () =>
+        this.port.getHistory(job.sourceChatId, {
+          ascending,
+          afterId: ascending ? job.cursor : undefined,
+          beforeId: ascending ? undefined : job.cursor,
+          limit,
+        }),
+      {
+        onWait: async (seconds) => {
+          await this.store.update(() => {
+            job.lastError = { message: `读取被限流，等待 ${seconds} 秒后继续`, at: this.clock.now() };
+          });
+        },
+      }
+    );
+    if (job.status !== "running") return;
+    if (!page.rawIds.length) {
+      await this.store.update(() => {
+        job.status = "planned";
+        job.finishedAt = this.clock.now();
+        job.updatedAt = this.clock.now();
+        job.lastError = undefined;
+      });
+      return;
+    }
+    // 按遍历顺序把连续的同组消息合成保存单位。
+    const units: SourceMessage[][] = [];
+    for (const m of page.messages) {
+      const last = units[units.length - 1];
+      if (m.groupedId && last && last[0].groupedId === m.groupedId) last.push(m);
+      else units.push([m]);
+    }
+    const before = (u: SourceMessage[]) => {
+      const ids = u.map((m) => m.id);
+      return ascending ? Math.min(...ids) - 1 : Math.max(...ids) + 1;
+    };
+    let cursor = page.rawIds[page.rawIds.length - 1];
+    const tail = units[units.length - 1];
+    if (page.rawIds.length >= limit && tail?.[0].groupedId) {
+      // 末尾相册可能延续到下一页：本页不入队，游标退回到该组之前。
+      units.pop();
+      cursor = before(tail);
+    }
+    const spec = this.specFromJob(job);
+    const counts = { queued: 0, filtered: 0, saved: 0, claimed: 0, attention: 0 };
+    for (const unit of units) {
+      if (this.stopped || job.status !== "running") return;
+      if (this.backupBacklog(job.id) >= this.options.backupBacklog) {
+        // 排队已满：停在这个保存单位之前，等执行者消化后继续。
+        cursor = before(unit);
+        break;
+      }
+      const members = unit.slice().sort((a, b) => a.id - b.id);
+      const res = await this.admitUnit(spec, members, { kind: "backup", groupedId: members[0].groupedId, force: job.force });
+      if (res.outcome === "queued") counts.queued++;
+      else if (res.outcome === "attention") counts.attention++;
+      else if (res.category === "filtered") counts.filtered++;
+      else if (res.category === "saved") counts.saved++;
+      else counts.claimed++;
+    }
+    const scanned = page.rawIds.filter((id) => (ascending ? id <= cursor : id >= cursor)).length;
+    await this.store.update(() => {
+      job.cursor = cursor;
+      job.counts.scanned += scanned;
+      job.counts.queued += counts.queued;
+      job.counts.filtered += counts.filtered;
+      job.counts.saved += counts.saved;
+      job.counts.claimed += counts.claimed;
+      job.counts.attention += counts.attention;
+      job.lastError = undefined;
+      job.updatedAt = this.clock.now();
+    });
+  }
+
+  async createBackup(input: Omit<BackupJob, "id" | "status" | "cursor" | "counts" | "createdAt" | "updatedAt">): Promise<BackupJob> {
+    const now = this.clock.now();
+    const job = await this.store.update((d) => {
+      const dup = d.backups.find(
+        (b) =>
+          (b.status === "running" || b.status === "paused" || b.status === "error") &&
+          b.sourceChatId === input.sourceChatId &&
+          b.target.peerId === input.target.peerId &&
+          b.target.topicId === input.target.topicId
+      );
+      if (dup) throw new SavePlusError("invalid", `已有未结束的备份 #${dup.id}（同一来源与目标），可用 backup resume ${dup.id} 继续`);
+      const created: BackupJob = {
+        ...input,
+        id: d.nextBackupId++,
+        status: "running",
+        cursor: 0,
+        counts: { scanned: 0, queued: 0, filtered: 0, saved: 0, claimed: 0, attention: 0, done: 0 },
+        createdAt: now,
+        updatedAt: now,
+      };
+      d.backups.push(created);
+      return created;
+    });
+    this.plannerWake?.();
+    return job;
+  }
+
+  getBackup(id: number): BackupJob | undefined {
+    return this.store.data.backups.find((b) => b.id === id);
+  }
+
+  async setBackupState(id: number, action: "pause" | "resume" | "cancel"): Promise<BackupJob> {
+    const job = this.getBackup(id);
+    if (!job) throw new SavePlusError("invalid", `备份 #${id} 不存在`);
+    const now = this.clock.now();
+    if (action === "pause") {
+      if (job.status !== "running") throw new SavePlusError("invalid", `备份 #${id} 当前不在运行`);
+      await this.store.update(() => {
+        job.status = "paused";
+        job.updatedAt = now;
+      });
+    } else if (action === "resume") {
+      if (job.status !== "paused" && job.status !== "error") throw new SavePlusError("invalid", `备份 #${id} 无需继续`);
+      await this.store.update(() => {
+        job.status = "running";
+        job.lastError = undefined;
+        job.updatedAt = now;
+      });
+      this.plannerWake?.();
+    } else {
+      if (job.status === "cancelled") throw new SavePlusError("invalid", `备份 #${id} 已取消`);
+      const open = await this.store.update(() => {
+        job.status = "cancelled";
+        job.finishedAt = now;
+        job.updatedAt = now;
+        const list = this.store.data.tasks.filter(
+          (t) => t.jobId === id && (t.status === "queued" || t.status === "retry_wait" || t.status === "needs_attention")
+        );
+        for (const t of list) {
+          t.status = "cancelled";
+          t.updatedAt = now;
+        }
+        return list;
+      });
+      for (const t of open) await this.removeStaging(t);
+      await this.store.update(() => {
+        for (const t of open) {
+          t.staged = undefined;
+          t.stagingDir = undefined;
+        }
+      });
+    }
+    return job;
   }
 
   // ── 任务操作（命令） ───────────────────────────────────────────────────────
@@ -2426,12 +3039,16 @@ export class Engine {
     if (FINISHED_STATUSES.has(t.status) || t.status === "cleanup_pending") {
       throw new SavePlusError("invalid", `任务 #${id} 当前为「${STATUS_LABEL[t.status]}」，不能取消`);
     }
-    if (t.status === "running" || t.status === "sending") {
-      throw new SavePlusError("invalid", `任务 #${id} 正在执行，请稍后再试`);
-    }
+    // 先在同一次写入中检查并改为“已取消”，再删除文件，避免与执行者同时操作。
+    await this.store.update(() => {
+      if (t.status === "running" || t.status === "sending") {
+        throw new SavePlusError("invalid", `任务 #${id} 正在执行，请稍后再试`);
+      }
+      t.status = "cancelled";
+      t.updatedAt = this.clock.now();
+    });
     await this.removeStaging(t);
     await this.mutate(t, (x) => {
-      x.status = "cancelled";
       x.staged = undefined;
       x.stagingDir = undefined;
     });
@@ -2443,13 +3060,25 @@ export class Engine {
     const t = this.getTask(id);
     if (!t) throw new SavePlusError("invalid", `任务 #${id} 不存在`);
     if (t.status !== "uncertain") throw new SavePlusError("invalid", `任务 #${id} 不是「结果不确定」状态`);
-    const items = t.staged || [];
+    let items: Array<Pick<StagedItem, "messageId" | "kind" | "text" | "size">> = t.staged || [];
     if (items.length !== t.memberIds.length) {
-      return `任务 #${id} 缺少完整的中转清单，无法核对；如确认未发送可执行 task resend ${id}`;
+      // 原生转发没有中转清单：按来源消息的内容核对。
+      const src = await this.readMessages(t.sourceChatId, t.memberIds);
+      if (t.memberIds.some((mid) => !src.has(mid))) {
+        return `任务 #${id} 的来源消息已无法读取，无法核对；如确认未发送可执行 task resend ${id}`;
+      }
+      items = t.memberIds.map((mid) => {
+        const m = src.get(mid) as SourceMessage;
+        return { messageId: mid, kind: m.kind, text: m.text, size: m.size };
+      });
     }
     const since = Math.floor((t.sendStartedAt ?? t.updatedAt) / 1000) - 5;
     const recent = (await this.port.findRecentOwn(t.target, since, 100)).sort((a, b) => a.id - b.id);
+    // 已归属于其他任务的目标消息不能作为本任务的证据。
     const used = new Set<number>();
+    for (const other of this.store.data.tasks) {
+      if (other.id !== t.id && other.target.peerId === t.target.peerId) for (const id of other.result?.messageIds ?? []) used.add(id);
+    }
     const matched: number[] = [];
     for (const it of items.slice().sort((a, b) => a.messageId - b.messageId)) {
       const hit = recent.find(
@@ -2517,45 +3146,58 @@ function mainPrefix(): string {
   return safePrefixes()[0] ?? ".";
 }
 
-function e(text: unknown): string {
-  return htmlEscape(text);
+/** 带当前主前缀的命令名（未转义）。 */
+function commandName(): string {
+  return `${mainPrefix()}${PLUGIN_NAME}`;
 }
 
 export function helpText(): string {
-  const p = mainPrefix();
-  const c = `${p}${PLUGIN_NAME}`;
+  const c = htmlEscape(commandName());
   return `💾 <b>SavePlus — 保存、在线监视与本地中转</b>
 
 <b>手动保存（兼容 save）</b>
 • 回复消息发送 <code>${c}</code> [临时目标] — 保存被回复的消息（相册整组）
 • <code>${c} 链接1 链接2 …</code> [临时目标] — 批量保存
 • <code>${c} 起始链接|结束链接</code> [临时目标] — 同一来源闭区间保存
+• 以上命令加 <code>--hide</code> — 原生转发时隐藏“转发自”
 • <code>${c} to 目标</code> · <code>${c} target</code> — 设置／查看默认目标
 • <code>${c} source on|off</code> · <code>${c} source</code> — 来源说明开关
 目标：<code>me</code> 收藏夹、<code>local</code> 本地归档、<code>here</code> 当前会话、<code>@用户名</code>、会话 ID，可加 <code>|话题ID</code>
 普通手动保存优先原生转发，受保护内容自动改为复制／下载重传；不套用监视过滤与去重。
 
-<b>在线监视</b>（只处理新消息；不跟随编辑；不自动扫描离线历史）
-• <code>${c} rule add 来源 目标</code> — 新建监视规则（一个来源一条）
+<b>在线监视</b>（只处理新消息；默认不跟随编辑；不自动扫描离线历史）
+• <code>${c} rule add 来源 目标 [选项…]</code> — 新建监视规则（一个来源一条）
+  选项：类型名、<code>silent</code> 静音、<code>forward</code> 原生转发、<code>hide</code> 隐藏发送者、<code>edited</code> 编辑后再存一份、<code>ad</code> 广告过滤
 • <code>${c} rule list</code> · <code>${c} rule show ID</code>
 • <code>${c} rule target ID 目标</code> — 修改目标（只影响之后接收的消息）
 • <code>${c} rule pause|resume ID[,ID]</code> — 暂停只停止接收新消息，已排队任务继续执行
 • <code>${c} rule del ID</code> — 删除规则，未完成的任务保留可查
+• <code>${c} rule mode ID relay|forward</code> — 本地中转（默认，保留封面）或原生转发（受保护来源自动改为中转）
+• <code>${c} rule hide|silent|edited ID on|off</code> — 隐藏发送者／静音／编辑后再存一份
 • <code>${c} rule type ID all|photo video …</code> — 类型：text photo video animation sticker voice audio document
 • <code>${c} rule bl ID add|del 关键词…</code> · <code>${c} rule bl ID clear</code> — 黑名单（命中即排除）
 • <code>${c} rule wl ID on|off</code> · <code>${c} rule wl ID add 正则</code> · <code>${c} rule wl ID del 序号</code> — 白名单
-过滤：类型符合 ＋ 未命中黑名单 ＋（白名单关闭或至少命中一条）。相册按整组文字与全部成员类型判断。
-监视的媒体一律<b>本地中转</b>：下载 → 携带来源视频封面上传 → 确认成功后删除中转文件；失败或封面无法保留时保留文件待处理。
+• <code>${c} rule ad ID on|off</code> — 广告过滤：带内联按钮、隐藏链接或自定义表情刷屏的消息不保存
+过滤：类型符合 ＋ 未命中广告特征（开启时）＋ 未命中黑名单 ＋（白名单关闭或至少命中一条）。相册按整组判断。
+默认<b>本地中转</b>：下载 → 携带来源视频封面上传 → 确认成功后删除中转文件；失败或封面无法保留时保留文件待处理。可按规则改为原生转发。
 
 <b>手动补漏</b>（沿用规则的过滤、目标与成功去重）
 • <code>${c} fill 规则ID 起始|结束</code> [expand] [force] — 起止可为消息链接或消息 ID
 <code>expand</code> 允许把跨出区间边缘的相册整组纳入；<code>force</code> 忽略成功记录强制重存（仍遵守过滤与封面要求）
 
+<b>整个历史备份</b>（不需要规则，可中断续传，已保存的自动跳过）
+• <code>${c} backup 来源 目标</code> [desc] [forward] [hide] [nofilter] [force] — 默认正序（旧→新）、本地中转；来源有规则时沿用其过滤
+• <code>${c} backup list</code> · <code>${c} backup status ID</code> · <code>${c} backup pause|resume|cancel ID</code>
+
 <b>任务与状态</b>
-• <code>${c} status</code> — 总览 · <code>${c} task</code> — 未完成任务 · <code>${c} task show ID</code>
+• <code>${c} status</code> — 总览 · <code>${c} stats [规则ID|backup ID]</code> — 保存统计 · <code>${c} task</code> — 未完成任务 · <code>${c} task show ID</code>
 • <code>${c} task retry ID|all</code> [force] [nocover] — 重试待处理任务（nocover：接受无来源封面）
 • <code>${c} task check ID</code> — 核对“结果不确定”的任务 · <code>${c} task resend ID</code> — 确认未发送后重发
-• <code>${c} task cancel ID</code> — 取消并删除中转文件`;
+• <code>${c} task cancel ID</code> — 取消并删除中转文件
+
+<b>规则导出与导入</b>
+• <code>${c} export</code> — 导出全部规则 · <code>${c} import</code> 换行粘贴 — 导入（同来源的规则会被更新）
+• <code>${c} import shift</code> [forward] — 直接导入现有 shift 规则（已有同来源规则时跳过）`;
 }
 
 function tokenize(text: string): string[] {
@@ -2592,6 +3234,39 @@ async function moveFile(from: string, to: string): Promise<void> {
     await fsp.copyFile(from, to);
     await fsp.unlink(from);
   }
+}
+
+interface RuleOptions extends DeliveryOptions {
+  types?: FilterConfig["types"];
+  ads?: boolean;
+}
+
+/** 解析规则选项（兼容 shift 的 silent / hide_author / handle_edited 写法）。 */
+export function parseRuleOptions(tokens: string[]): RuleOptions {
+  const out: RuleOptions = {};
+  const kinds: MediaKind[] = [];
+  for (const raw of tokens) {
+    const t = raw.toLowerCase();
+    if (t === "silent") out.silent = true;
+    else if (t === "forward") out.mode = "forward";
+    else if (t === "relay") out.mode = "relay";
+    else if (t === "hide" || t === "hide_author" || t === "--hide") out.hideAuthor = true;
+    else if (t === "edited" || t === "handle_edited") out.handleEdited = true;
+    else if (t === "ad" || t === "ads" || t === "noad") out.ads = true;
+    else if (t === "all") out.types = "all";
+    else if (KIND_ALIASES[t] ?? KIND_ALIASES[raw]) kinds.push((KIND_ALIASES[t] ?? KIND_ALIASES[raw]) as MediaKind);
+    else throw new SavePlusError("invalid", `未知选项：${raw}`);
+  }
+  if (kinds.length && out.types !== "all") out.types = Array.from(new Set(kinds));
+  return out;
+}
+
+function describeDelivery(o: DeliveryOptions): string {
+  const r = deliveryOf(o);
+  const parts = [r.mode === "forward" ? `原生转发${r.hideAuthor ? "（隐藏发送者）" : ""}` : "本地中转"];
+  if (r.silent) parts.push("静音");
+  if (r.handleEdited) parts.push("编辑后再存一份");
+  return parts.join(" · ");
 }
 
 export class SavePlusCore {
@@ -2659,7 +3334,7 @@ export class SavePlusCore {
         case "to":
           return await this.setDefaultTarget(msg, tokens.slice(1));
         case "target":
-          return await this.reply(msg, `🎯 当前默认目标：<code>${e(this.store.data.settings.defaultTarget)}</code>`);
+          return await this.reply(msg, `🎯 当前默认目标：<code>${htmlEscape(this.store.data.settings.defaultTarget)}</code>`);
         case "source":
           return await this.sourceSetting(msg, tokens[1]);
         case "rule":
@@ -2670,12 +3345,20 @@ export class SavePlusCore {
           return await this.taskCommand(msg, tokens.slice(1));
         case "status":
           return await this.reply(msg, this.statusText());
+        case "stats":
+          return await this.reply(msg, this.statsText(tokens.slice(1)));
+        case "export":
+          return await this.exportRules(msg);
+        case "import":
+          return await this.importCommand(msg, raw);
+        case "backup":
+          return await this.backupCommand(msg, tokens.slice(1));
         default:
           return await this.manualFromCommand(msg, tokens);
       }
     } catch (err) {
       const text = err instanceof SavePlusError ? err.message : errorText(err);
-      await this.reply(msg, `❌ ${e(text)}`);
+      await this.reply(msg, `❌ ${htmlEscape(text)}`).catch((replyErr) => this.engine.deps.log?.("回复命令失败", replyErr));
     }
   }
 
@@ -2696,7 +3379,7 @@ export class SavePlusCore {
     await this.store.update((d) => {
       d.settings.defaultTarget = stored;
     });
-    await this.reply(msg, `✅ 默认目标已设为：<b>${e(label)}</b>（<code>${e(stored)}</code>）`);
+    await this.reply(msg, `✅ 默认目标已设为：<b>${htmlEscape(label)}</b>（<code>${htmlEscape(stored)}</code>）`);
   }
 
   private async sourceSetting(msg: CommandMessage, arg?: string): Promise<void> {
@@ -2728,16 +3411,17 @@ export class SavePlusCore {
   }
 
   private ruleSummary(r: RuleRecord): string {
-    return `#${r.id} ${r.enabled ? "▶️" : "⏸"} <b>${e(r.sourceTitle)}</b> → <b>${e(targetLabel(r.target))}</b>`;
+    return `#${r.id} ${r.enabled ? "▶️" : "⏸"} <b>${htmlEscape(r.sourceTitle)}</b> → <b>${htmlEscape(targetLabel(r.target))}</b>（${htmlEscape(describeDelivery(r))}）`;
   }
 
   private async ruleCommand(msg: CommandMessage, raw: string): Promise<void> {
     const tokens = tokenize(raw).slice(1);
     const op = tokens[0]?.toLowerCase();
-    const c = `${mainPrefix()}${PLUGIN_NAME}`;
+    const c = commandName();
     switch (op) {
       case "add": {
-        if (tokens.length !== 3) throw new SavePlusError("invalid", `用法：${c} rule add 来源 目标`);
+        if (tokens.length < 3) throw new SavePlusError("invalid", `用法：${c} rule add 来源 目标 [选项…]`);
+        const ropts = parseRuleOptions(tokens.slice(3));
         const srcSpec = parseTargetSpec(tokens[1], chatIdOf(msg));
         if ("error" in srcSpec || srcSpec.kind !== "peer" || srcSpec.topicId) {
           throw new SavePlusError("invalid", "来源需为 @用户名、会话 ID、t.me 链接或 here");
@@ -2758,26 +3442,35 @@ export class SavePlusCore {
             sourceTitle: source.title,
             target,
             enabled: true,
-            filter: defaultFilter(),
+            filter: { ...defaultFilter(), types: ropts.types ?? "all", ads: Boolean(ropts.ads) },
+            mode: ropts.mode ?? "relay",
+            hideAuthor: ropts.hideAuthor || undefined,
+            silent: ropts.silent || undefined,
+            handleEdited: ropts.handleEdited || undefined,
             createdAt: now,
             updatedAt: now,
           };
           d.rules.push(r);
           return r;
         });
-        return this.reply(msg, `✅ 已创建监视规则\n${this.ruleSummary(rule)}\n过滤：全部类型，无黑白名单`);
+        const typeText =
+          (rule.filter.types === "all" ? "全部类型" : rule.filter.types.map((k) => KIND_LABEL[k]).join("、")) +
+          (rule.filter.ads ? "，广告过滤已开启" : "");
+        const hint =
+          rule.hideAuthor && rule.mode !== "forward" ? "\nℹ️ 本地中转本身不显示“转发自”，hide 仅在原生转发时生效" : "";
+        return this.reply(msg, `✅ 已创建监视规则\n${this.ruleSummary(rule)}\n过滤：${typeText}，无黑白名单${hint}`);
       }
       case "list":
       case undefined: {
         const rules = this.store.data.rules;
-        if (!rules.length) return this.reply(msg, `📋 暂无监视规则。使用 <code>${e(c)} rule add 来源 目标</code> 创建`);
+        if (!rules.length) return this.reply(msg, `📋 暂无监视规则。使用 <code>${htmlEscape(c)} rule add 来源 目标</code> 创建`);
         return this.reply(msg, `📋 <b>监视规则</b>\n${rules.map((r) => this.ruleSummary(r)).join("\n")}`);
       }
       case "show": {
         const r = this.rule(tokens[1]);
         return this.reply(
           msg,
-          `${this.ruleSummary(r)}\n来源 ID：<code>${e(r.sourceChatId)}</code>\n目标 ID：<code>${e(r.target.peerId)}</code>\n<pre>${e(describeFilter(r.filter))}</pre>`
+          `${this.ruleSummary(r)}\n投递：${htmlEscape(describeDelivery(r))}\n来源 ID：<code>${htmlEscape(r.sourceChatId)}</code>\n目标 ID：<code>${htmlEscape(r.target.peerId)}</code>\n<pre>${htmlEscape(describeFilter(r.filter))}</pre>`
         );
       }
       case "target": {
@@ -2790,7 +3483,7 @@ export class SavePlusCore {
         await this.touchRule(r, (x) => {
           x.target = target;
         });
-        return this.reply(msg, `✅ 规则 #${r.id} 的目标已改为 <b>${e(targetLabel(target))}</b>（已排队的任务仍发往原目标）`);
+        return this.reply(msg, `✅ 规则 #${r.id} 的目标已改为 <b>${htmlEscape(targetLabel(target))}</b>（已排队的任务仍发往原目标）`);
       }
       case "pause":
       case "resume": {
@@ -2838,6 +3531,50 @@ export class SavePlusCore {
         });
         return this.reply(msg, `✅ 规则 #${r.id} 类型：${types === "all" ? "全部" : types.map((k) => KIND_LABEL[k]).join("、")}`);
       }
+      case "mode": {
+        const r = this.rule(tokens[1]);
+        const v = tokens[2]?.toLowerCase();
+        if (v !== "relay" && v !== "forward") throw new SavePlusError("invalid", `用法：${c} rule mode ID relay|forward`);
+        await this.touchRule(r, (x) => {
+          x.mode = v;
+        });
+        const note = v === "forward" ? "；来源受保护时自动改为本地中转" : "（下载后重新上传，保留来源封面）";
+        return this.reply(msg, `✅ 规则 #${r.id} 投递方式：${v === "forward" ? "原生转发" : "本地中转"}${note}`);
+      }
+      case "ad":
+      case "ads": {
+        const r = this.rule(tokens[1]);
+        const v = tokens[2]?.toLowerCase();
+        if (v !== "on" && v !== "off") throw new SavePlusError("invalid", `用法：${c} rule ad ID on|off`);
+        await this.touchRule(r, (x) => {
+          x.filter.ads = v === "on";
+        });
+        return this.reply(
+          msg,
+          `✅ 规则 #${r.id} 广告过滤：${v === "on" ? `开启（带内联按钮、隐藏链接或自定义表情≥${CUSTOM_EMOJI_AD_THRESHOLD} 个的消息不保存；相册任一条命中则整组跳过）` : "关闭"}`
+        );
+      }
+      case "hide":
+      case "silent":
+      case "edited": {
+        const r = this.rule(tokens[1]);
+        const v = tokens[2]?.toLowerCase();
+        if (v !== "on" && v !== "off") throw new SavePlusError("invalid", `用法：${c} rule ${op} ID on|off`);
+        const on = v === "on";
+        await this.touchRule(r, (x) => {
+          if (op === "hide") x.hideAuthor = on || undefined;
+          else if (op === "silent") x.silent = on || undefined;
+          else x.handleEdited = on || undefined;
+        });
+        const label = op === "hide" ? "隐藏发送者" : op === "silent" ? "静音发送" : "编辑后再存一份";
+        const hint =
+          op === "hide" && on && deliveryOf(r).mode !== "forward"
+            ? "\nℹ️ 当前为本地中转，本身不显示“转发自”；该选项在原生转发时生效"
+            : op === "edited" && on
+              ? "\nℹ️ 来源编辑后会再保存一份新版，目标中已有的旧版不会被修改"
+              : "";
+        return this.reply(msg, `✅ 规则 #${r.id} ${label}：${on ? "开启" : "关闭"}${hint}`);
+      }
       case "bl":
       case "blacklist":
         return this.blacklistCommand(msg, tokens);
@@ -2870,7 +3607,7 @@ export class SavePlusCore {
       throw new SavePlusError("invalid", "用法：rule bl ID add|del 关键词… 或 rule bl ID clear");
     }
     const list = r.filter.blacklist;
-    await this.reply(msg, `🚫 规则 #${r.id} 黑名单：${list.length ? list.map((w) => `<code>${e(w)}</code>`).join(" ") : "（空）"}`);
+    await this.reply(msg, `🚫 规则 #${r.id} 黑名单：${list.length ? list.map((w) => `<code>${htmlEscape(w)}</code>`).join(" ") : "（空）"}`);
   }
 
   private async whitelistCommand(msg: CommandMessage, raw: string, tokens: string[]): Promise<void> {
@@ -2909,7 +3646,7 @@ export class SavePlusCore {
       throw new SavePlusError("invalid", "用法：rule wl ID on|off|add 正则|del 序号|clear");
     }
     const wl = r.filter.whitelist;
-    const list = wl.patterns.map((p, i) => `${i + 1}. <code>${e(p)}</code>`).join("\n") || "（空）";
+    const list = wl.patterns.map((p, i) => `${i + 1}. <code>${htmlEscape(p)}</code>`).join("\n") || "（空）";
     await this.reply(msg, `✅ 规则 #${r.id} 白名单：<b>${wl.enabled ? "已启用" : "未启用"}</b>\n${list}`);
   }
 
@@ -2927,7 +3664,7 @@ export class SavePlusCore {
   }
 
   private async fillCommand(msg: CommandMessage, args: string[]): Promise<void> {
-    const c = `${mainPrefix()}${PLUGIN_NAME}`;
+    const c = commandName();
     if (args.length < 2) throw new SavePlusError("invalid", `用法：${c} fill 规则ID 起始|结束 [expand] [force]`);
     const rule = this.rule(args[0]);
     const flags = new Set(args.slice(2).map((a) => a.toLowerCase()));
@@ -2937,7 +3674,7 @@ export class SavePlusCore {
     if (bounds.length !== 2) throw new SavePlusError("invalid", "范围格式：起始|结束（链接或消息 ID）");
     const a = await this.parseRangeBound(bounds[0], rule);
     const b = await this.parseRangeBound(bounds[1], rule);
-    await this.reply(msg, `⏳ 正在规划规则 #${rule.id} 的补漏范围 ${Math.min(a, b)}–${Math.max(a, b)}…`);
+    await this.progress(msg, `⏳ 正在规划规则 #${rule.id} 的补漏范围 ${Math.min(a, b)}–${Math.max(a, b)}…`);
     const summary = await this.backfill(rule, a, b, { expand: flags.has("expand"), force: flags.has("force") });
     await this.reply(msg, summary);
   }
@@ -2950,7 +3687,8 @@ export class SavePlusCore {
       throw new SavePlusError("invalid", `范围过大（${span} 条），单次上限 ${this.engine.options.maxRangeSpan} 条，请分段补漏`);
     }
     const ids = Array.from({ length: span }, (_, i) => min + i);
-    const fetched = await this.port.getMessages(rule.sourceChatId, ids);
+    const readOpts = { maxWaitSeconds: this.engine.options.fillMaxFloodWaitSeconds };
+    const fetched = await this.engine.readMessages(rule.sourceChatId, ids, readOpts);
     const singles: SourceMessage[] = [];
     const groups = new Map<string, SourceMessage[]>();
     for (const m of Array.from(fetched.values()).sort((x, y) => x.id - y.id)) {
@@ -2963,7 +3701,7 @@ export class SavePlusCore {
       const outside: number[] = [];
       for (let id = Math.max(1, min - probe); id < min; id++) outside.push(id);
       for (let id = max + 1; id <= max + probe; id++) outside.push(id);
-      const around = await this.port.getMessages(rule.sourceChatId, outside);
+      const around = await this.engine.readMessages(rule.sourceChatId, outside, readOpts);
       for (const [gid, members] of groups) {
         const extra = Array.from(around.values()).filter((m) => m.groupedId === gid);
         if (!extra.length) continue;
@@ -2982,7 +3720,7 @@ export class SavePlusCore {
     const count = { queued: 0, filtered: 0, saved: 0, claimed: 0, attention: 0 };
     const reasons = new Map<string, number>();
     for (const unit of units) {
-      const res = await this.engine.admitUnit(rule, unit, {
+      const res = await this.engine.admitUnit(specFromRule(rule), unit, {
         kind: "backfill",
         groupedId: unit[0].groupedId,
         force: flags.force,
@@ -2997,7 +3735,7 @@ export class SavePlusCore {
     }
     const missing = ids.filter((id) => !fetched.has(id)).length;
     const lines = [
-      `📥 <b>补漏规划完成</b> · 规则 #${rule.id}（${e(rule.sourceTitle)} → ${e(targetLabel(rule.target))}）`,
+      `📥 <b>补漏规划完成</b> · 规则 #${rule.id}（${htmlEscape(rule.sourceTitle)} → ${htmlEscape(targetLabel(rule.target))}）`,
       `范围：${min}–${max}（${span} 个 ID，读取到 ${fetched.size} 条，${missing} 个 ID 不存在或无法读取）`,
       `已加入队列：${count.queued} 个保存单位`,
       `已保存跳过：${count.saved} · 进行中跳过：${count.claimed} · 过滤跳过：${count.filtered} · 待处理：${count.attention}`,
@@ -3006,7 +3744,7 @@ export class SavePlusCore {
       lines.push(
         `过滤原因：${Array.from(reasons.entries())
           .slice(0, 5)
-          .map(([r, n]) => `${e(r)}×${n}`)
+          .map(([r, n]) => `${htmlEscape(r)}×${n}`)
           .join("；")}`
       );
     }
@@ -3015,14 +3753,17 @@ export class SavePlusCore {
     }
     if (flags.force) lines.push("⚠️ 已启用 force：忽略成功记录强制重存");
     if (!rule.enabled) lines.push("ℹ️ 规则当前已暂停；补漏任务仍会执行");
-    lines.push(`进度可用 <code>${e(mainPrefix() + PLUGIN_NAME)} task</code> 查看`);
+    lines.push(`进度可用 <code>${htmlEscape(commandName())} task</code> 查看`);
     return lines.join("\n");
   }
 
   // ── 普通手动保存 ─────────────────────────────────────────────────────────
 
-  private async manualFromCommand(msg: CommandMessage, tokens: string[]): Promise<void> {
+  private async manualFromCommand(msg: CommandMessage, allTokens: string[]): Promise<void> {
     const current = chatIdOf(msg);
+    const hideFlags = new Set(["--hide", "hide_author"]);
+    const hideAuthor = allTokens.some((t) => hideFlags.has(t.toLowerCase()));
+    const tokens = allTokens.filter((t) => !hideFlags.has(t.toLowerCase()));
     const links: MessageLink[] = [];
     let range: { a: MessageLink; b: MessageLink } | undefined;
     let target: TargetSpec | undefined;
@@ -3063,16 +3804,16 @@ export class SavePlusCore {
       if ("error" in spec) throw new SavePlusError("invalid", `默认目标无效：${spec.error}`);
       target = spec;
     }
-    await this.reply(msg, "⏳ 正在读取消息…");
+    await this.progress(msg, "⏳ 正在读取消息…");
     const units = await this.collectManualUnits({ links, range, reply: !links.length && !range ? { chatId: current as string, id: replyId as number } : undefined });
     if (!units.unitList.length) {
-      return this.reply(msg, `❌ 没有可保存的消息${units.notes.length ? `\n${units.notes.map(e).join("\n")}` : ""}`);
+      return this.reply(msg, `❌ 没有可保存的消息${units.notes.length ? `\n${units.notes.map((n) => htmlEscape(n)).join("\n")}` : ""}`);
     }
     if (target.kind === "local") {
       return this.manualToLocal(msg, units.unitList, units.notes);
     }
     const peerTarget = await this.resolveTarget(target, { forRule: false });
-    return this.manualToPeer(msg, peerTarget, units.unitList, units.notes, Boolean(range));
+    return this.manualToPeer(msg, peerTarget, units.unitList, units.notes, Boolean(range), hideAuthor);
   }
 
   /** 读取手动保存的消息并归为保存单位：回复与链接模式补全相册整组；范围模式按区间内成员成组。 */
@@ -3139,7 +3880,11 @@ export class SavePlusCore {
       if (span > this.engine.options.maxRangeSpan) {
         throw new SavePlusError("invalid", `范围过大（${span} 条），单次上限 ${this.engine.options.maxRangeSpan} 条`);
       }
-      const got = await this.port.getMessages(ia.peerId, Array.from({ length: span }, (_, i) => min + i));
+      const got = await this.engine.readMessages(
+        ia.peerId,
+        Array.from({ length: span }, (_, i) => min + i),
+        { maxWaitSeconds: this.engine.options.fillMaxFloodWaitSeconds }
+      );
       const groups = new Map<string, SourceMessage[]>();
       const ordered: SourceMessage[][] = [];
       for (const m of Array.from(got.values()).sort((x, y) => x.id - y.id)) {
@@ -3162,21 +3907,43 @@ export class SavePlusCore {
     return { unitList, notes };
   }
 
-  private async withFloodRetry<T>(fn: () => Promise<T>, target?: PeerTarget, idsOf?: (r: T) => number[]): Promise<T> {
+  /** 手动保存可以在命令中等待的最长限流时间（秒）；更长时停止本次保存并说明。 */
+  private static readonly MANUAL_MAX_WAIT_SECONDS = 120;
+
+  /**
+   * 以手动保存的节奏发送；weight 为本次发出的消息条数。
+   * 限流针对整个账号：任何限流都会让后台任务一起冷却；等待时间过长时直接报错，不让命令长时间挂起。
+   */
+  private async withFloodRetry<T>(
+    fn: () => Promise<T>,
+    target?: PeerTarget,
+    idsOf?: (r: T) => number[],
+    weight = 1
+  ): Promise<T> {
+    const maxWait = SavePlusCore.MANUAL_MAX_WAIT_SECONDS;
     for (let attempt = 0; ; attempt++) {
-      await this.engine.limiter.acquire();
+      const pending = Math.ceil(this.engine.manualLimiter.cooldownRemainingMs / 1000);
+      if (pending > maxWait) {
+        throw new SavePlusError("flood", `账号正在 Telegram 限流冷却中，还需等待 ${pending} 秒`, { seconds: pending });
+      }
+      await this.engine.manualLimiter.acquire(undefined, weight);
       try {
         if (target && idsOf) return await this.engine.withInflight(target, fn, idsOf);
         return await fn();
       } catch (err) {
         const c = classifyError(err, "send");
-        if (c.code === "flood" && attempt < 2 && (c.seconds ?? 0) <= 120) {
-          this.engine.limiter.applyCooldown(((c.seconds ?? 1) + 1) * 1000);
-          continue;
-        }
-        throw c;
+        if (c.code !== "flood") throw c;
+        const seconds = c.seconds ?? 1;
+        this.engine.applyFloodCooldown((seconds + 1) * 1000);
+        if (attempt < 2 && seconds <= maxWait) continue;
+        throw new SavePlusError("flood", `触发 Telegram 限流，需要等待 ${seconds} 秒`, { seconds });
       }
     }
+  }
+
+  /** 发送进度提示；失败（例如命令消息已被删除）不影响命令继续执行。 */
+  private async progress(msg: CommandMessage, html: string): Promise<void> {
+    await this.reply(msg, html).catch(() => undefined);
   }
 
   private async copyUnit(target: PeerTarget, members: SourceMessage[]): Promise<{ ids: number[]; warnings: string[] }> {
@@ -3189,7 +3956,8 @@ export class SavePlusCore {
       const id = await this.withFloodRetry(
         () => this.port.sendText(target, m.text, m.entities, { linkPreview: m.webPreview }),
         target,
-        (r) => [r]
+        (r) => [r],
+        1
       );
       return { ids: [id], warnings: [] };
     }
@@ -3206,7 +3974,8 @@ export class SavePlusCore {
       const sent = await this.withFloodRetry(
         () => this.port.sendStaged(target, items, { topicId: target.topicId }),
         target,
-        (r) => r.messageIds
+        (r) => r.messageIds,
+        items.length
       );
       return { ids: sent.messageIds, warnings: [...warnings, ...sent.warnings] };
     } finally {
@@ -3219,17 +3988,23 @@ export class SavePlusCore {
     target: PeerTarget,
     units: Array<{ info: PeerInfo; members: SourceMessage[] }>,
     notes: string[],
-    isRange: boolean
+    isRange: boolean,
+    hideAuthor = false
   ): Promise<void> {
     const results: UnitResult[] = [];
     let lastProgress = 0;
+    let floodStop: string | undefined;
     for (let i = 0; i < units.length; i++) {
       const { info, members } = units[i];
       const ids = members.map((m) => m.id);
+      if (floodStop) {
+        results.push({ chatId: info.peerId, ids, ok: false, reason: `未执行：${floodStop}` });
+        continue;
+      }
       const now = Date.now();
       if (now - lastProgress > 1500) {
         lastProgress = now;
-        await this.reply(msg, `⏳ 正在保存 ${i + 1}/${units.length} → ${e(targetLabel(target))}`).catch(() => undefined);
+        await this.progress(msg, `⏳ 正在保存 ${i + 1}/${units.length} → ${htmlEscape(targetLabel(target))}`);
       }
       try {
         let targetIds: number[];
@@ -3237,7 +4012,12 @@ export class SavePlusCore {
         const restricted = info.noforwards || members.some((m) => m.noforwards);
         if (!restricted) {
           try {
-            targetIds = await this.withFloodRetry(() => this.port.forwardMessages(target, info.peerId, ids), target, (r) => r);
+            targetIds = await this.withFloodRetry(
+              () => this.port.forwardMessages(target, info.peerId, ids, { dropAuthor: hideAuthor }),
+              target,
+              (r) => r,
+              ids.length
+            );
           } catch (err) {
             if (classifyError(err, "send").code !== "forward_restricted") throw err;
             ({ ids: targetIds, warnings } = await this.copyUnit(target, members));
@@ -3247,11 +4027,14 @@ export class SavePlusCore {
         }
         results.push({ chatId: info.peerId, ids, ok: true, targetIds, warnings });
       } catch (err) {
-        results.push({ chatId: info.peerId, ids, ok: false, reason: classifyError(err, "send").message });
+        const c = classifyError(err, "send");
+        results.push({ chatId: info.peerId, ids, ok: false, reason: c.message });
+        if (c.code === "flood") floodStop = c.message;
       }
     }
     const ok = results.filter((r) => r.ok);
-    if (this.store.data.settings.showSource && ok.length) {
+    if (floodStop) notes.push(`因限流停止，剩余项目未发送；${floodStop}，之后可重新执行`);
+    if (this.store.data.settings.showSource && ok.length && !floodStop) {
       await this.sendSourceNote(target, ok, units, isRange).catch((err) => notes.push(`来源说明发送失败：${classifyError(err, "send").message}`));
     }
     await this.reply(msg, this.manualSummary(target, results, notes));
@@ -3263,12 +4046,12 @@ export class SavePlusCore {
     const msgCount = ok.reduce((n, r) => n + r.ids.length, 0);
     const lines = [
       failed.length ? (ok.length ? "⚠️ <b>部分保存完成</b>" : "❌ <b>保存失败</b>") : "✅ <b>保存完成</b>",
-      `目标：${e(targetLabel(target))}`,
+      `目标：${htmlEscape(targetLabel(target))}`,
       `成功：${ok.length} 个保存单位（${msgCount} 条消息）· 失败：${failed.length}`,
     ];
-    for (const f of failed.slice(0, 10)) lines.push(`• ${f.ids.join(",")}：${e(f.reason)}`);
-    for (const r of ok) for (const w of r.warnings || []) lines.push(`⚠️ ${e(w)}`);
-    for (const n of notes) lines.push(`ℹ️ ${e(n)}`);
+    for (const f of failed.slice(0, 10)) lines.push(`• ${f.ids.join(",")}：${htmlEscape(f.reason)}`);
+    for (const r of ok) for (const w of r.warnings || []) lines.push(`⚠️ ${htmlEscape(w)}`);
+    for (const n of notes) lines.push(`ℹ️ ${htmlEscape(n)}`);
     return lines.join("\n");
   }
 
@@ -3286,16 +4069,16 @@ export class SavePlusCore {
       const info = infoOf(last.chatId);
       const id = last.ids[0];
       html =
-        `🔗 <b>消息来源</b>\n\n📝 <a href="${e(messageLink(last.chatId, id, info?.username))}">查看原消息</a>\n` +
-        `👤 来源对话：<b>${e(info?.title ?? last.chatId)}</b>\n#️⃣ 消息ID：<code>${last.ids.join(", ")}</code>`;
+        `🔗 <b>消息来源</b>\n\n📝 <a href="${htmlEscape(messageLink(last.chatId, id, info?.username))}">查看原消息</a>\n` +
+        `👤 来源对话：<b>${htmlEscape(info?.title ?? last.chatId)}</b>\n#️⃣ 消息ID：<code>${last.ids.join(", ")}</code>`;
     } else if (isRange) {
       const info = infoOf(ok[0].chatId);
       const first = ok[0].ids[0];
       const end = last.ids[last.ids.length - 1];
       html =
-        `🔗 <b>范围保存来源</b>\n\n👤 <b>${e(info?.title ?? ok[0].chatId)}</b>\n` +
-        `▶️ <a href="${e(messageLink(ok[0].chatId, first, info?.username))}">起始消息 ${first}</a>\n` +
-        `⏹ <a href="${e(messageLink(ok[0].chatId, end, info?.username))}">结尾消息 ${end}</a>`;
+        `🔗 <b>范围保存来源</b>\n\n👤 <b>${htmlEscape(info?.title ?? ok[0].chatId)}</b>\n` +
+        `▶️ <a href="${htmlEscape(messageLink(ok[0].chatId, first, info?.username))}">起始消息 ${first}</a>\n` +
+        `⏹ <a href="${htmlEscape(messageLink(ok[0].chatId, end, info?.username))}">结尾消息 ${end}</a>`;
     } else {
       const byChat = new Map<string, number[]>();
       for (const r of ok) byChat.set(r.chatId, [...(byChat.get(r.chatId) || []), ...r.ids]);
@@ -3304,11 +4087,11 @@ export class SavePlusCore {
         const ranges = compactRanges(ids)
           .map(([s, t]) =>
             s === t
-              ? `<a href="${e(messageLink(chatId, s, info?.username))}">${s}</a>`
-              : `<a href="${e(messageLink(chatId, s, info?.username))}">${s}</a>–<a href="${e(messageLink(chatId, t, info?.username))}">${t}</a>`
+              ? `<a href="${htmlEscape(messageLink(chatId, s, info?.username))}">${s}</a>`
+              : `<a href="${htmlEscape(messageLink(chatId, s, info?.username))}">${s}</a>–<a href="${htmlEscape(messageLink(chatId, t, info?.username))}">${t}</a>`
           )
           .join(", ");
-        return `👤 <b>${e(info?.title ?? chatId)}</b>（${new Set(ids).size} 条）：${ranges}`;
+        return `👤 <b>${htmlEscape(info?.title ?? chatId)}</b>（${new Set(ids).size} 条）：${ranges}`;
       });
       const body = sections.join("\n");
       html = `🔗 <b>批量保存来源</b>\n\n${body.length > 350 || sections.length > 6 ? `<blockquote expandable>${body}</blockquote>` : body}`;
@@ -3316,7 +4099,8 @@ export class SavePlusCore {
     await this.withFloodRetry(
       () => this.port.sendText(target, html, [], { html: true, replyTo, linkPreview: false }),
       target,
-      (r) => [r]
+      (r) => [r],
+      1
     );
   }
 
@@ -3340,7 +4124,7 @@ export class SavePlusCore {
         done++;
         if (Date.now() - lastProgress > 1500) {
           lastProgress = Date.now();
-          await this.reply(msg, `⏳ 正在保存到本地 ${done}/${total}`).catch(() => undefined);
+          await this.progress(msg, `⏳ 正在保存到本地 ${done}/${total}`);
         }
         if (m.kind === "text") {
           skipped++;
@@ -3425,12 +4209,12 @@ export class SavePlusCore {
     }
     const lines = [
       failures.length ? (entries.length ? "⚠️ <b>本地保存部分完成</b>" : "❌ <b>本地保存失败</b>") : "✅ <b>本地保存完成</b>",
-      `目录：<code>${e(archive)}</code>`,
+      `目录：<code>${htmlEscape(archive)}</code>`,
       `已保存媒体：${entries.length} · 纯文字跳过：${skipped} · 失败：${failures.length}`,
     ];
-    if (indexPath) lines.push(`索引：<code>${e(path.basename(indexPath))}</code>`);
-    for (const f of failures.slice(0, 10)) lines.push(`• ${e(f)}`);
-    for (const n of notes) lines.push(`ℹ️ ${e(n)}`);
+    if (indexPath) lines.push(`索引：<code>${htmlEscape(path.basename(indexPath))}</code>`);
+    for (const f of failures.slice(0, 10)) lines.push(`• ${htmlEscape(f)}`);
+    for (const n of notes) lines.push(`ℹ️ ${htmlEscape(n)}`);
     await this.reply(msg, lines.join("\n"));
   }
 
@@ -3440,14 +4224,14 @@ export class SavePlusCore {
     const ids = compactRanges(t.memberIds)
       .map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`))
       .join(",");
-    const kind = t.kind === "backfill" ? "补漏" : "监视";
-    const err = t.lastError && t.status !== "done" ? ` — ${e(t.lastError.message.slice(0, 120))}` : "";
-    return `#${t.id} [${STATUS_LABEL[t.status]}] ${kind} ${e(t.sourceTitle)}:${ids} → ${e(targetLabel(t.target))}${err}`;
+    const kind = t.kind === "backfill" ? "补漏" : t.kind === "backup" ? `备份#${t.jobId}` : t.editVersion ? "监视·编辑版" : "监视";
+    const err = t.lastError && t.status !== "done" ? ` — ${htmlEscape(t.lastError.message.slice(0, 120))}` : "";
+    return `#${t.id} [${STATUS_LABEL[t.status]}] ${kind} ${htmlEscape(t.sourceTitle)}:${ids} → ${htmlEscape(targetLabel(t.target))}${err}`;
   }
 
   private async taskCommand(msg: CommandMessage, args: string[]): Promise<void> {
     const op = args[0]?.toLowerCase();
-    const c = `${mainPrefix()}${PLUGIN_NAME}`;
+    const c = commandName();
     const idArg = () => {
       const id = Number(args[1]);
       if (!Number.isInteger(id) || id <= 0) throw new SavePlusError("invalid", "请提供任务 ID");
@@ -3466,7 +4250,7 @@ export class SavePlusCore {
         const shown = tasks.slice(-25);
         return this.reply(
           msg,
-          `🗂 <b>任务</b>（显示 ${shown.length}/${tasks.length}）\n${shown.map((t) => this.taskLine(t)).join("\n")}\n\n<code>${e(c)} task show ID</code> 查看详情`
+          `🗂 <b>任务</b>（显示 ${shown.length}/${tasks.length}）\n${shown.map((t) => this.taskLine(t)).join("\n")}\n\n<code>${htmlEscape(c)} task show ID</code> 查看详情`
         );
       }
       case "show": {
@@ -3484,11 +4268,11 @@ export class SavePlusCore {
               .map((s) => `${s.messageId}(${KIND_LABEL[s.kind]}${s.coverKind ? `·封面:${s.coverKind}` : ""}${s.size ? `·${formatBytes(s.size)}` : ""})`)
               .join("，")}`
           );
-          if (t.stagingDir) lines.push(`中转目录：<code>${e(t.stagingDir)}</code>`);
+          if (t.stagingDir) lines.push(`中转目录：<code>${htmlEscape(t.stagingDir)}</code>`);
         }
         if (t.result) lines.push(`目标消息：${t.result.messageIds.join(", ")}（确认方式：${t.result.via}）`);
-        for (const w of t.warnings || []) lines.push(`⚠️ ${e(w)}`);
-        if (t.lastError) lines.push(`原因：${e(t.lastError.message)}`);
+        for (const w of t.warnings || []) lines.push(`⚠️ ${htmlEscape(w)}`);
+        if (t.lastError) lines.push(`原因：${htmlEscape(t.lastError.message)}`);
         return this.reply(msg, lines.join("\n"));
       }
       case "retry": {
@@ -3498,17 +4282,419 @@ export class SavePlusCore {
           return this.reply(msg, `🔁 已重新排队 ${n} 个任务`);
         }
         const text = await this.engine.retryTask(idArg(), { force: flags.has("force"), allowNoCover: flags.has("nocover") });
-        return this.reply(msg, `🔁 ${e(text)}`);
+        return this.reply(msg, `🔁 ${htmlEscape(text)}`);
       }
       case "check":
-        return this.reply(msg, `🔎 ${e(await this.engine.checkTask(idArg()))}`);
+        return this.reply(msg, `🔎 ${htmlEscape(await this.engine.checkTask(idArg()))}`);
       case "resend":
-        return this.reply(msg, `📤 ${e(await this.engine.resendTask(idArg()))}`);
+        return this.reply(msg, `📤 ${htmlEscape(await this.engine.resendTask(idArg()))}`);
       case "cancel":
-        return this.reply(msg, `🛑 ${e(await this.engine.cancelTask(idArg()))}`);
+        return this.reply(msg, `🛑 ${htmlEscape(await this.engine.cancelTask(idArg()))}`);
       default:
         throw new SavePlusError("invalid", `未知的 task 子命令：${args[0]}`);
     }
+  }
+
+  // ── 统计 ────────────────────────────────────────────────────────────────
+
+  statsText(args: string[] = []): string {
+    const d = this.store.data;
+    const now = this.engine.clock.now();
+    const today = dayKey(now);
+    const weekStart = dayKey(now - 6 * 86_400_000);
+    const sum = (scope: string, from: string) => {
+      let units = 0;
+      let messages = 0;
+      for (const [day, bucket] of Object.entries(d.stats)) {
+        if (day < from) continue;
+        const c = bucket[scope];
+        if (c) {
+          units += c.units;
+          messages += c.messages;
+        }
+      }
+      return { units, messages };
+    };
+    const fmt = (c: { units: number; messages: number }) => `${c.units} 单位／${c.messages} 条`;
+    const daily = (scope: string, title: string) => {
+      const days = Object.keys(d.stats)
+        .filter((day) => d.stats[day][scope])
+        .sort()
+        .reverse()
+        .slice(0, 14);
+      const rows = days.map((day) => `${day}：${fmt(d.stats[day][scope])}`);
+      return `📈 <b>${title} 保存统计</b>\n${rows.join("\n") || "暂无数据"}`;
+    };
+    if (args[0]?.toLowerCase() === "backup") {
+      const b = this.engine.getBackup(Number(args[1]));
+      if (!b) throw new SavePlusError("invalid", `备份 ${args[1] ?? ""} 不存在`);
+      return daily(`backup:${b.id}`, `备份 #${b.id}（${htmlEscape(b.sourceTitle)} → ${htmlEscape(targetLabel(b.target))}）`);
+    }
+    const arg = args[0];
+    if (arg) {
+      const r = this.rule(arg);
+      const scope = `rule:${r.id}`;
+      const days = Object.keys(d.stats)
+        .filter((day) => d.stats[day][scope])
+        .sort()
+        .reverse()
+        .slice(0, 14);
+      const rows = days.map((day) => `${day}：${fmt(d.stats[day][scope])}`);
+      return `📈 <b>规则 #${r.id} 保存统计</b>（${htmlEscape(r.sourceTitle)} → ${htmlEscape(targetLabel(r.target))}）\n${rows.join("\n") || "暂无数据"}`;
+    }
+    const scopes = new Set<string>();
+    for (const bucket of Object.values(d.stats)) for (const k of Object.keys(bucket)) scopes.add(k);
+    if (!scopes.size) return "📈 暂无保存统计";
+    const lines = [`📈 <b>保存统计</b>（今日／近 7 天／保留期内，保留 ${this.engine.options.statsRetentionDays} 天）`];
+    const label = (scope: string) => {
+      const [kind, id] = scope.split(":");
+      if (kind === "backup") {
+        const b = this.engine.getBackup(Number(id));
+        return `备份 #${id}${b ? ` ${htmlEscape(b.sourceTitle)} → ${htmlEscape(targetLabel(b.target))}` : ""}`;
+      }
+      const r = d.rules.find((x) => x.id === Number(id));
+      return `规则 #${id}${r ? ` ${htmlEscape(r.sourceTitle)} → ${htmlEscape(targetLabel(r.target))}` : "（已删除）"}`;
+    };
+    for (const scope of Array.from(scopes).sort()) {
+      lines.push(`• ${label(scope)}：${fmt(sum(scope, today))}／${fmt(sum(scope, weekStart))}／${fmt(sum(scope, ""))}`);
+    }
+    return lines.join("\n");
+  }
+
+  // ── 规则导出与导入 ───────────────────────────────────────────────────────
+
+  private async exportRules(msg: CommandMessage): Promise<void> {
+    const rules = this.store.data.rules;
+    if (!rules.length) return this.reply(msg, "📭 没有可导出的规则");
+    const payload = {
+      format: "saveplus-rules",
+      version: 1,
+      exportedAt: new Date(this.engine.clock.now()).toISOString(),
+      rules: rules.map((r) => ({
+        sourceChatId: r.sourceChatId,
+        sourceTitle: r.sourceTitle,
+        target: r.target,
+        enabled: r.enabled,
+        filter: r.filter,
+        ...deliveryOf(r),
+      })),
+    };
+    const json = JSON.stringify(payload);
+    const b64 = Buffer.from(json, "utf8").toString("base64");
+    const c = commandName();
+    if (b64.length <= 3300) {
+      return this.reply(
+        msg,
+        `📤 <b>规则配置</b>（${rules.length} 条）\n<code>${b64}</code>\n\n导入：发送 <code>${htmlEscape(c)} import</code>，换行后粘贴上面的内容`
+      );
+    }
+    const dir = path.join(this.dirs.data, "exports");
+    await fsp.mkdir(dir, { recursive: true });
+    const file = await uniquePath(dir, `rules_${new Date(this.engine.clock.now()).toISOString().replace(/[:.]/g, "-")}.json`);
+    await fsp.writeFile(file, JSON.stringify(payload, null, 2));
+    return this.reply(msg, `📤 规则较多（${rules.length} 条），已导出到文件：\n<code>${htmlEscape(file)}</code>\n可将文件内容粘贴到 <code>${htmlEscape(c)} import</code> 后导入`);
+  }
+
+  private decodeImport(text: string): unknown {
+    const trimmed = text.trim();
+    if (!trimmed) throw new SavePlusError("invalid", "请在 import 后换行粘贴导出的内容");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      try {
+        parsed = JSON.parse(Buffer.from(trimmed.replace(/\s+/g, ""), "base64").toString("utf8"));
+      } catch {
+        throw new SavePlusError("invalid", "无法识别导入内容：既不是 JSON，也不是 Base64 编码的 JSON");
+      }
+    }
+    if (typeof parsed === "string") {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {
+        /* 保持原样 */
+      }
+    }
+    return parsed;
+  }
+
+  private async importCommand(msg: CommandMessage, raw: string): Promise<void> {
+    const rest = raw.replace(/^\s*import\b/i, "");
+    const [firstLine, ...more] = rest.split("\n");
+    const flags = tokenize(firstLine).map((t) => t.toLowerCase());
+    const fromShiftFile = flags[0] === "shift" && !more.join("").trim();
+    const keepForward = flags.includes("forward");
+    let data: unknown;
+    let label: string;
+    if (fromShiftFile) {
+      // shift 的数据位于同一宿主 assets 目录下（只读）。
+      const file = path.join(path.dirname(this.dirs.data), "shift", "shift_v2.json");
+      let text: string;
+      try {
+        text = await fsp.readFile(file, "utf8");
+      } catch {
+        throw new SavePlusError("not_found", `未找到 shift 的规则数据：${file}`);
+      }
+      data = (JSON.parse(text) as { rules?: unknown }).rules;
+      label = "shift 规则文件";
+    } else {
+      const payload = more.length ? more.join("\n") : flags.filter((f) => f !== "shift" && f !== "forward").join("");
+      data = this.decodeImport(payload);
+      label = "导入内容";
+    }
+    const candidates = this.importCandidates(data, { keepForward });
+    await this.progress(msg, `⏳ 正在导入 ${candidates.list.length} 条规则（来自${label}）…`);
+    const added: string[] = [];
+    const updated: string[] = [];
+    const skipped: string[] = [];
+    const failed: string[] = [];
+    for (const cand of candidates.list) {
+      let source: PeerInfo;
+      let target: PeerTarget;
+      try {
+        source = await this.port.resolvePeer(cand.sourceRef);
+        target = await this.resolveTarget({ kind: "peer", ref: cand.targetRef, topicId: cand.topicId }, { forRule: true });
+        if (target.peerId === source.peerId) throw new SavePlusError("invalid", "来源与目标相同");
+      } catch (err) {
+        failed.push(`${cand.sourceRef} → ${cand.targetRef}：${classifyError(err, "read").message}`);
+        continue;
+      }
+      const now = this.engine.clock.now();
+      const outcome = await this.store.update((d) => {
+        const exists = d.rules.find((r) => r.sourceChatId === source.peerId);
+        if (exists && candidates.format === "shift") return `skip:${exists.id}`;
+        const fields = {
+          sourceTitle: source.title,
+          target,
+          enabled: cand.enabled,
+          filter: cand.filter,
+          mode: cand.mode,
+          hideAuthor: cand.hideAuthor || undefined,
+          silent: cand.silent || undefined,
+          handleEdited: cand.handleEdited || undefined,
+          updatedAt: now,
+        };
+        if (exists) {
+          Object.assign(exists, fields);
+          return `update:${exists.id}`;
+        }
+        const r: RuleRecord = { id: d.nextRuleId++, sourceChatId: source.peerId, createdAt: now, ...fields };
+        d.rules.push(r);
+        return `add:${r.id}`;
+      });
+      const [kind, id] = outcome.split(":");
+      const text = `#${id} ${source.title} → ${targetLabel(target)}`;
+      if (kind === "add") added.push(text);
+      else if (kind === "update") updated.push(text);
+      else skipped.push(`${source.title}：已有规则 #${id}，未覆盖`);
+    }
+    const lines = [
+      `📥 <b>导入完成</b>（${label}）`,
+      `新增 ${added.length} · 更新 ${updated.length} · 跳过 ${skipped.length} · 失败 ${failed.length}`,
+      ...added.map((t) => `➕ ${htmlEscape(t)}`),
+      ...updated.map((t) => `♻️ ${htmlEscape(t)}`),
+      ...skipped.map((t) => `⏭ ${htmlEscape(t)}`),
+      ...failed.map((t) => `❌ ${htmlEscape(t)}`),
+      ...candidates.notes.map((t) => `ℹ️ ${htmlEscape(t)}`),
+    ];
+    await this.reply(msg, lines.join("\n"));
+  }
+
+  /** 把 saveplus 导出或 shift 规则（导出内容或数据文件）转换为待导入规则。 */
+  private importCandidates(
+    data: unknown,
+    opts: { keepForward: boolean }
+  ): {
+    format: "saveplus" | "shift";
+    notes: string[];
+    list: Array<
+      Required<DeliveryOptions> & {
+        sourceRef: string;
+        targetRef: string;
+        topicId?: number;
+        enabled: boolean;
+        filter: FilterConfig;
+      }
+    >;
+  } {
+    const notes: string[] = [];
+    const cleanPatterns = (patterns: unknown, where: string): string[] => {
+      const out: string[] = [];
+      for (const p of Array.isArray(patterns) ? patterns : []) {
+        if (typeof p !== "string") continue;
+        const problem = validateRegex(p);
+        if (problem) notes.push(`${where} 的白名单「${p}」未导入：${problem}`);
+        else out.push(p);
+      }
+      return out;
+    };
+    const obj = data as Record<string, unknown> | null;
+    if (obj && typeof obj === "object" && obj.format === "saveplus-rules" && Array.isArray(obj.rules)) {
+      const list = (obj.rules as Array<Record<string, any>>).map((r) => {
+        const types = r.filter?.types;
+        const filter: FilterConfig = {
+          types:
+            types === "all" || !Array.isArray(types)
+              ? "all"
+              : (types.filter((k: string) => FILTER_KINDS.includes(k as MediaKind)) as MediaKind[]),
+          blacklist: Array.isArray(r.filter?.blacklist) ? r.filter.blacklist.filter((w: unknown) => typeof w === "string") : [],
+          whitelist: { enabled: false, patterns: cleanPatterns(r.filter?.whitelist?.patterns, String(r.sourceChatId)) },
+          ads: Boolean(r.filter?.ads),
+        };
+        filter.whitelist.enabled = Boolean(r.filter?.whitelist?.enabled) && filter.whitelist.patterns.length > 0;
+        return {
+          sourceRef: String(r.sourceChatId),
+          targetRef: r.target?.isSelf ? "me" : String(r.target?.peerId),
+          topicId: typeof r.target?.topicId === "number" ? r.target.topicId : undefined,
+          enabled: r.enabled !== false,
+          filter,
+          mode: (r.mode === "forward" ? "forward" : "relay") as DeliveryMode,
+          hideAuthor: Boolean(r.hideAuthor),
+          silent: Boolean(r.silent),
+          handleEdited: Boolean(r.handleEdited),
+        };
+      });
+      return { format: "saveplus", notes, list };
+    }
+    const looksShift =
+      obj && typeof obj === "object" && Object.values(obj).every((v) => v && typeof v === "object" && "target_id" in (v as object));
+    if (!looksShift || !Object.keys(obj as object).length) {
+      throw new SavePlusError("invalid", "导入内容不是 saveplus 导出的规则，也不是 shift 规则");
+    }
+    let bothLists = false;
+    const list = Object.entries(obj as Record<string, Record<string, any>>).map(([sourceId, rule]) => {
+      const options: string[] = Array.isArray(rule.options) ? rule.options.map(String) : [];
+      const kinds = options.map((o) => KIND_ALIASES[o.toLowerCase()]).filter(Boolean) as MediaKind[];
+      const topic = options.find((o) => o.startsWith("replyTo:"));
+      const topicId = topic ? Number(topic.slice("replyTo:".length)) : undefined;
+      const patterns = cleanPatterns(rule.whitelistPatterns, sourceId);
+      const blacklist: string[] = Array.isArray(rule.filters) ? rule.filters.filter((w: unknown) => typeof w === "string") : [];
+      const wlOn = Boolean(rule.whitelistMode) && patterns.length > 0;
+      if (wlOn && blacklist.length) bothLists = true;
+      return {
+        sourceRef: sourceId,
+        targetRef: String(rule.target_id),
+        topicId: topicId && Number.isSafeInteger(topicId) && topicId > 0 ? topicId : undefined,
+        enabled: !rule.paused,
+        filter: {
+          types: options.includes("all") || !kinds.length ? ("all" as const) : Array.from(new Set(kinds)),
+          blacklist,
+          whitelist: { enabled: wlOn, patterns },
+          ads: false,
+        },
+        mode: (opts.keepForward ? "forward" : "relay") as DeliveryMode,
+        hideAuthor: options.includes("hide_author"),
+        silent: options.includes("silent"),
+        handleEdited: options.includes("handle_edited"),
+      };
+    });
+    notes.push(
+      opts.keepForward
+        ? "已按 shift 的方式使用原生转发（来源受保护时自动改为本地中转）"
+        : "导入后默认使用本地中转（保留来源封面）；如需与 shift 一样原生转发，可用 import shift forward 或 rule mode ID forward"
+    );
+    if (bothLists) notes.push("shift 启用白名单时会忽略黑名单；在 saveplus 中两者同时生效，请确认黑名单是否仍需要");
+    return { format: "shift", notes, list };
+  }
+
+  // ── 整个历史备份 ─────────────────────────────────────────────────────────
+
+  private backupLine(b: BackupJob): string {
+    const state: Record<BackupStatus, string> = {
+      running: "进行中",
+      paused: "已暂停",
+      planned: "历史已读完",
+      cancelled: "已取消",
+      error: "出错",
+    };
+    const tasks = this.store.data.tasks.filter((t) => t.jobId === b.id);
+    const done = b.counts.done;
+    const open = tasks.filter((t) => !FINISHED_STATUSES.has(t.status) && t.status !== "needs_attention" && t.status !== "uncertain").length;
+    const extra = b.status === "planned" ? (open ? `，剩余 ${open} 个执行中` : "，已全部完成") : "";
+    return `#${b.id} [${state[b.status]}${extra}] ${htmlEscape(b.sourceTitle)} → ${htmlEscape(targetLabel(b.target))}（${b.order === "asc" ? "正序" : "倒序"}，已保存 ${done}）`;
+  }
+
+  private async backupCommand(msg: CommandMessage, args: string[]): Promise<void> {
+    const c = commandName();
+    const sub = args[0]?.toLowerCase();
+    if (!sub || sub === "list") {
+      const jobs = this.store.data.backups.slice(-20);
+      if (!jobs.length) return this.reply(msg, `📭 暂无备份。使用 <code>${htmlEscape(c)} backup 来源 目标</code> 创建`);
+      return this.reply(msg, `🗄 <b>整个历史备份</b>\n${jobs.map((b) => this.backupLine(b)).join("\n")}`);
+    }
+    if (["status", "show", "pause", "resume", "cancel"].includes(sub)) {
+      const id = Number(args[1]);
+      if (!Number.isInteger(id) || id <= 0) throw new SavePlusError("invalid", "请提供备份 ID");
+      if (sub === "status" || sub === "show") return this.reply(msg, this.backupStatus(id));
+      const job = await this.engine.setBackupState(id, sub as "pause" | "resume" | "cancel");
+      const text = { pause: "已暂停（已排队的任务会继续执行）", resume: "已继续", cancel: "已取消，未开始的任务与其中转文件已删除" }[
+        sub as "pause" | "resume" | "cancel"
+      ];
+      return this.reply(msg, `✅ 备份 #${job.id} ${text}`);
+    }
+    const flagSet = new Set(["asc", "--asc", "desc", "--desc", "forward", "hide", "--hide", "hide_author", "nofilter", "--nofilter", "force"]);
+    const positional = args.filter((a) => !flagSet.has(a.toLowerCase()));
+    const flags = new Set(args.filter((a) => flagSet.has(a.toLowerCase())).map((a) => a.toLowerCase().replace(/^--/, "")));
+    if (positional.length !== 2) {
+      throw new SavePlusError("invalid", `用法：${c} backup 来源 目标 [asc|desc] [forward] [hide] [nofilter] [force]`);
+    }
+    if (flags.has("asc") && flags.has("desc")) throw new SavePlusError("invalid", "asc 与 desc 不能同时使用");
+    const srcSpec = parseTargetSpec(positional[0], chatIdOf(msg));
+    if ("error" in srcSpec || srcSpec.kind !== "peer" || srcSpec.topicId) {
+      throw new SavePlusError("invalid", "来源需为 @用户名、会话 ID、t.me 链接或 here");
+    }
+    const source = await this.port.resolvePeer(srcSpec.ref);
+    if (source.kind === "self") throw new SavePlusError("invalid", "不能备份收藏夹");
+    const tSpec = parseTargetSpec(positional[1], chatIdOf(msg));
+    if ("error" in tSpec) throw new SavePlusError("invalid", tSpec.error);
+    const target = await this.resolveTarget(tSpec, { forRule: true });
+    if (target.peerId === source.peerId) throw new SavePlusError("invalid", "来源与目标不能相同");
+    const rule = this.engine.ruleForChat(source.peerId);
+    const useRuleFilter = Boolean(rule) && !flags.has("nofilter");
+    const job = await this.engine.createBackup({
+      sourceChatId: source.peerId,
+      sourceTitle: source.title,
+      target,
+      filter: useRuleFilter ? (JSON.parse(JSON.stringify((rule as RuleRecord).filter)) as FilterConfig) : defaultFilter(),
+      filterFrom: useRuleFilter ? "rule" : "none",
+      order: flags.has("desc") ? "desc" : "asc",
+      mode: flags.has("forward") ? "forward" : "relay",
+      hideAuthor: flags.has("hide") || flags.has("hide_author"),
+      force: flags.has("force"),
+    });
+    const lines = [
+      `🗄 <b>已创建备份 #${job.id}</b>`,
+      `${htmlEscape(job.sourceTitle)} → ${htmlEscape(targetLabel(job.target))}`,
+      `顺序：${job.order === "asc" ? "正序（旧→新，保持原始顺序）" : "倒序（新→旧）"}`,
+      `投递：${describeDelivery(job)}`,
+      `过滤：${useRuleFilter ? `沿用规则 #${(rule as RuleRecord).id} 的过滤` : rule ? "不过滤（nofilter）" : "不过滤（该来源没有监视规则）"}`,
+      "已成功保存到该目标的消息会跳过，中断后会从断点继续",
+      `进度：<code>${htmlEscape(c)} backup status ${job.id}</code>`,
+    ];
+    if (job.force) lines.push("⚠️ 已启用 force：忽略成功记录强制重存");
+    if (job.hideAuthor && job.mode !== "forward") lines.push("ℹ️ 本地中转本身不显示“转发自”，hide 仅在原生转发时生效");
+    return this.reply(msg, lines.join("\n"));
+  }
+
+  private backupStatus(id: number): string {
+    const b = this.engine.getBackup(id);
+    if (!b) throw new SavePlusError("invalid", `备份 #${id} 不存在`);
+    const tasks = this.store.data.tasks.filter((t) => t.jobId === id);
+    const by = (st: TaskStatus) => tasks.filter((t) => t.status === st).length;
+    const pending = tasks.filter((t) => ["queued", "running", "sending", "retry_wait", "cleanup_pending"].includes(t.status)).length;
+    const lines = [
+      this.backupLine(b),
+      `投递：${describeDelivery(b)} · 过滤：${b.filterFrom === "rule" ? "沿用规则" : "不过滤"}${b.force ? " · 强制重存" : ""}`,
+      `已读取 ${b.counts.scanned} 条（游标 ${b.cursor || "起点"}）`,
+      `入队 ${b.counts.queued} · 已保存跳过 ${b.counts.saved} · 进行中跳过 ${b.counts.claimed} · 过滤跳过 ${b.counts.filtered}`,
+      `任务：完成 ${b.counts.done} · 执行中 ${pending} · 待处理 ${by("needs_attention")} · 结果不确定 ${by("uncertain")}`,
+      `开始：${new Date(b.createdAt).toLocaleString()}${b.finishedAt ? ` · 读完：${new Date(b.finishedAt).toLocaleString()}` : ""}`,
+    ];
+    if (b.lastError) lines.push(`⚠️ ${htmlEscape(b.lastError.message)}`);
+    if (by("needs_attention") || by("uncertain")) {
+      lines.push(`待处理或不确定的任务可用 <code>${htmlEscape(commandName())} task</code> 查看`);
+    }
+    return lines.join("\n");
   }
 
   statusText(): string {
@@ -3524,13 +4710,13 @@ export class SavePlusCore {
       `未完成任务：${active.length ? active.join(" · ") : "无"}`,
       `成功保存记录：${Object.keys(d.successes).length} 条`,
     ];
-    const cooldown = this.engine.limiter.cooldownRemainingMs;
+    const cooldown = this.engine.cooldownRemainingMs;
     if (cooldown > 0) lines.push(`⏳ 限流冷却中：剩余 ${Math.ceil(cooldown / 1000)} 秒`);
-    if (d.hold) lines.push(`⛔ 执行已暂停：${e(d.hold.reason)}（处理后用 task retry all 恢复）`);
+    if (d.hold) lines.push(`⛔ 执行已暂停：${htmlEscape(d.hold.reason)}（处理后用 task retry all 恢复）`);
     if (d.recentSkips.length) {
       lines.push("最近跳过：");
       for (const s of d.recentSkips.slice(0, 5)) {
-        lines.push(`• 规则 #${s.ruleId} 消息 ${s.messageIds.join(",")}：${e(s.reason)}`);
+        lines.push(`• ${s.jobId ? `备份 #${s.jobId}` : `规则 #${s.ruleId}`} 消息 ${s.messageIds.join(",")}：${htmlEscape(s.reason)}`);
       }
     }
     lines.push("在线监视只处理插件运行期间收到的新消息；离线期间的缺口请用 fill 手动补漏。");
@@ -3560,7 +4746,8 @@ export class SavePlusPlugin extends Plugin {
   name = PLUGIN_NAME;
   description = (): string => helpText();
   ignoreEdited = true;
-  listenMessageHandlerIgnoreEdited = true;
+  /** 接收编辑事件；只有开启“编辑后再存一份”的规则会处理。 */
+  listenMessageHandlerIgnoreEdited = false;
   private engine: Engine | null = null;
   private core: SavePlusCore | null = null;
   private starting: Promise<void> | null = null;
@@ -3583,7 +4770,7 @@ export class SavePlusPlugin extends Plugin {
 
   listenMessageHandler = async (msg: Api.Message, options?: { isEdited?: boolean }): Promise<void> => {
     const engine = this.engine;
-    if (!engine || options?.isEdited) return;
+    if (!engine) return;
     await engine.onMessage(msg, options);
   };
 
@@ -3611,6 +4798,7 @@ export class SavePlusPlugin extends Plugin {
         staging: path.join(tempDir, "staging"),
         manual: path.join(tempDir, "manual"),
         archive: path.join(dataDir, "archive"),
+        data: dataDir,
       },
       options: { ...DEFAULT_OPTIONS, ...(this.config.options || {}) },
       diskFree: this.config.diskFree,

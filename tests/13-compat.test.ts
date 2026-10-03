@@ -37,7 +37,7 @@ test("13 交付物是单文件插件，只依赖宿主提供的模块与 Node �
 
 test("13 帮助覆盖全部入口，说明暂停语义、封面要求与离线补漏方式", () => {
   const help = helpText();
-  for (const sub of ["to 目标", "target", "source on|off", "rule add", "rule list", "rule target", "rule pause|resume", "rule del", "rule type", "rule bl", "rule wl", "fill 规则ID", "status", "task retry", "task check", "task resend", "task cancel"]) {
+  for (const sub of ["to 目标", "target", "source on|off", "rule add", "rule list", "rule target", "rule pause|resume", "rule del", "rule type", "rule bl", "rule wl", "fill 规则ID", "status", "task retry", "task check", "task resend", "task cancel", "rule mode ID relay|forward", "rule hide|silent|edited", "backup 来源 目标", "backup status ID", "backup pause|resume|cancel", "stats", "export", "import shift", "--hide"]) {
     assert.ok(help.includes(sub), `帮助缺少 ${sub}`);
   }
   assert.match(help, /暂停只停止接收新消息，已排队任务继续执行/);

@@ -31,3 +31,6 @@ CLAUDE.md
 CONTEXT.md
 .scratch/
 todo.md
+
+# 本地参考用的 TeleBox-Plugins 克隆（shift 插件），不属于本仓库
+shift/
