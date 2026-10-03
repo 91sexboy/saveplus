@@ -1924,6 +1924,10 @@ export class Engine {
   private readonly inflightTargets = new Map<string, number>();
   private readonly diskFree: (dir: string) => Promise<number | undefined>;
   private stoppedResolve: (() => void) | null = null;
+  /** 正在执行的任务及其中止控制（用于取消处理中的任务）。 */
+  private current: { id: number; controller: AbortController } | null = null;
+  /** 已请求取消、但仍在处理或发送中的任务。 */
+  private readonly cancelRequests = new Set<number>();
   private readonly stoppedPromise = new Promise<void>((r) => {
     this.stoppedResolve = r;
   });
@@ -2430,7 +2434,12 @@ export class Engine {
       await this.cleanupTask(t);
       return;
     }
-    const signal = this.abort.signal;
+    // 每个任务独立的中止信号：插件停止或用户取消时中断下载与等待。
+    const controller = new AbortController();
+    const onStop = () => controller.abort();
+    this.abort.signal.addEventListener("abort", onStop, { once: true });
+    const signal = controller.signal;
+    this.current = { id: t.id, controller };
     try {
       // 原子地认领任务：期间若已被取消或改变状态，则不执行。
       const claimed = await this.store.update(() => {
@@ -2474,10 +2483,7 @@ export class Engine {
         if (!restricted) {
           await this.limiter.acquire(signal, t.memberIds.length);
           if (this.stopped) throw new SavePlusError("stopped", "插件正在停止");
-          await this.mutate(t, (x) => {
-            x.status = "sending";
-            x.sendStartedAt = this.clock.now();
-          });
+          await this.markSending(t);
           try {
             const ids = await this.withInflight(
               t.target,
@@ -2534,10 +2540,7 @@ export class Engine {
       }
       await this.limiter.acquire(signal, items.length);
       if (this.stopped) throw new SavePlusError("stopped", "插件正在停止");
-      await this.mutate(t, (x) => {
-        x.status = "sending";
-        x.sendStartedAt = this.clock.now();
-      });
+      await this.markSending(t);
       const sent = await this.withInflight(
         t.target,
         () => this.port.sendStaged(t.target, items, { topicId: t.target.topicId, silent: t.silent }),
@@ -2547,7 +2550,34 @@ export class Engine {
       await this.cleanupTask(t);
     } catch (e) {
       await this.handleFailure(t, e);
+    } finally {
+      this.abort.signal.removeEventListener("abort", onStop);
+      if (this.current?.id === t.id) this.current = null;
+      this.cancelRequests.delete(t.id);
     }
+  }
+
+  /** 进入发送阶段；与取消请求在同一次写入中判定，已请求取消则不再发送。 */
+  private async markSending(t: TaskRecord): Promise<void> {
+    await this.store.update(() => {
+      if (this.cancelRequests.has(t.id)) throw new SavePlusError("stopped", "任务已被取消");
+      t.status = "sending";
+      t.sendStartedAt = this.clock.now();
+      t.updatedAt = this.clock.now();
+    });
+  }
+
+  /** 把任务结束为“已取消”，并删除它的中转文件（含下载到一半的文件）。 */
+  private async finishCancelled(t: TaskRecord): Promise<void> {
+    await this.mutate(t, (x) => {
+      x.status = "cancelled";
+      x.lastError = { code: "cancelled", message: "已按用户要求取消", at: this.clock.now() };
+    });
+    await this.removeStaging(t).catch((e) => this.log(`删除任务 #${t.id} 的中转文件失败`, e));
+    await this.mutate(t, (x) => {
+      x.staged = undefined;
+      x.stagingDir = undefined;
+    });
   }
 
   /** 在一次持久写入中记录所有成员的成功保存记录，并把任务转为待清理。 */
@@ -2665,7 +2695,15 @@ export class Engine {
   private async handleFailure(t: TaskRecord, e: unknown): Promise<void> {
     const err = classifyError(e, "read");
     const now = this.clock.now();
-    if (err.code === "stopped") {
+    if (this.cancelRequests.has(t.id) && !this.store.isClosed && t.status !== "cleanup_pending") {
+      this.cancelRequests.delete(t.id);
+      // 发送结果无法确认时不能当作“未发送”，保持结果不确定，交给用户核对。
+      if (err.code !== "uncertain") {
+        await this.finishCancelled(t);
+        return;
+      }
+    }
+    if (err.code === "stopped" || (this.stopped && t.status === "running")) {
       if (!this.store.isClosed && t.status === "running") {
         await this.mutate(t, (x) => {
           x.status = "queued";
@@ -2981,26 +3019,12 @@ export class Engine {
       this.plannerWake?.();
     } else {
       if (job.status === "cancelled") throw new SavePlusError("invalid", `备份 #${id} 已取消`);
-      const open = await this.store.update(() => {
+      await this.store.update(() => {
         job.status = "cancelled";
         job.finishedAt = now;
         job.updatedAt = now;
-        const list = this.store.data.tasks.filter(
-          (t) => t.jobId === id && (t.status === "queued" || t.status === "retry_wait" || t.status === "needs_attention")
-        );
-        for (const t of list) {
-          t.status = "cancelled";
-          t.updatedAt = now;
-        }
-        return list;
       });
-      for (const t of open) await this.removeStaging(t);
-      await this.store.update(() => {
-        for (const t of open) {
-          t.staged = undefined;
-          t.stagingDir = undefined;
-        }
-      });
+      await this.cancelMany((t) => t.jobId === id);
     }
     return job;
   }
@@ -3075,27 +3099,61 @@ export class Engine {
     return `任务 #${id} 将重新发送（若之前其实已发送，目标中会出现重复）`;
   }
 
-  /** 取消任务：释放保存权并删除该任务的中转文件。已成功的任务不能取消。 */
+  /**
+   * 取消任务。排队、等待重试、待处理、结果不确定的任务立即取消并删除中转文件；
+   * 处理中的任务中断下载后取消；发送中的任务因请求无法撤回，等本次发送结束：
+   * 已发出则保留为已完成，失败则不再重试，无法确认时保持结果不确定。
+   */
+  async requestCancel(t: TaskRecord): Promise<"cancelled" | "stopping" | "after_send" | "final"> {
+    const outcome = await this.store.update(() => {
+      if (FINISHED_STATUSES.has(t.status) || t.status === "cleanup_pending") return "final" as const;
+      if (t.status === "running" || t.status === "sending") {
+        this.cancelRequests.add(t.id);
+        if (t.status === "running" && this.current?.id === t.id) this.current.controller.abort();
+        return t.status === "running" ? ("stopping" as const) : ("after_send" as const);
+      }
+      t.status = "cancelled";
+      t.lastError = { code: "cancelled", message: "已按用户要求取消", at: this.clock.now() };
+      t.updatedAt = this.clock.now();
+      return "cancelled" as const;
+    });
+    if (outcome === "cancelled") {
+      await this.removeStaging(t).catch((e) => this.log(`删除任务 #${t.id} 的中转文件失败`, e));
+      await this.mutate(t, (x) => {
+        x.staged = undefined;
+        x.stagingDir = undefined;
+      });
+    }
+    return outcome;
+  }
+
   async cancelTask(id: number): Promise<string> {
     const t = this.getTask(id);
     if (!t) throw new SavePlusError("invalid", `任务 #${id} 不存在`);
-    if (FINISHED_STATUSES.has(t.status) || t.status === "cleanup_pending") {
-      throw new SavePlusError("invalid", `任务 #${id} 当前为「${STATUS_LABEL[t.status]}」，不能取消`);
+    const outcome = await this.requestCancel(t);
+    switch (outcome) {
+      case "final":
+        throw new SavePlusError("invalid", `任务 #${id} 当前为「${STATUS_LABEL[t.status]}」，不能取消`);
+      case "stopping":
+        return `正在停止任务 #${id}：中断下载后取消，并删除中转文件`;
+      case "after_send":
+        return `任务 #${id} 正在向目标发送，发送请求无法撤回：本次发送结束后停止（已发出则保留为已完成；失败则不再重试；无法确认时标为结果不确定）`;
+      default:
+        return `任务 #${id} 已取消，中转文件已删除`;
     }
-    // 先在同一次写入中检查并改为“已取消”，再删除文件，避免与执行者同时操作。
-    await this.store.update(() => {
-      if (t.status === "running" || t.status === "sending") {
-        throw new SavePlusError("invalid", `任务 #${id} 正在执行，请稍后再试`);
-      }
-      t.status = "cancelled";
-      t.updatedAt = this.clock.now();
-    });
-    await this.removeStaging(t);
-    await this.mutate(t, (x) => {
-      x.staged = undefined;
-      x.stagingDir = undefined;
-    });
-    return `任务 #${id} 已取消，中转文件已删除`;
+  }
+
+  /** 批量取消：返回各类结果的数量。 */
+  async cancelMany(match: (t: TaskRecord) => boolean): Promise<{ cancelled: number; stopping: number; afterSend: number; matched: number }> {
+    const targets = this.store.data.tasks.filter((t) => match(t) && !FINISHED_STATUSES.has(t.status) && t.status !== "cleanup_pending");
+    const counts = { cancelled: 0, stopping: 0, afterSend: 0, matched: targets.length };
+    for (const t of targets) {
+      const outcome = await this.requestCancel(t);
+      if (outcome === "cancelled") counts.cancelled++;
+      else if (outcome === "stopping") counts.stopping++;
+      else if (outcome === "after_send") counts.afterSend++;
+    }
+    return counts;
   }
 
   /** 核对结果不确定的任务：在目标中查找与中转内容一致的、本账号在发送后发出的消息。 */
@@ -3236,7 +3294,8 @@ export function helpText(): string {
 • <code>${c} status</code> — 总览 · <code>${c} stats [规则ID|backup ID]</code> — 保存统计 · <code>${c} task</code> — 未完成任务 · <code>${c} task show ID</code>
 • <code>${c} task retry ID|all</code> [force] [nocover] — 重试待处理任务（nocover：接受无来源封面）
 • <code>${c} task check ID</code> — 核对“结果不确定”的任务 · <code>${c} task resend ID</code> — 确认未发送后重发
-• <code>${c} task cancel ID</code> — 取消并删除中转文件
+• <code>${c} task cancel ID[,ID…]</code> — 取消并删除中转文件；处理中的任务会中断下载，正在发送的等本次发送结束
+• <code>${c} task cancel all</code> · <code>${c} task cancel rule 规则ID</code> · <code>${c} task cancel backup 备份ID</code> — 批量取消
 
 <b>规则导出与导入</b>
 • <code>${c} export</code> — 导出全部规则 · <code>${c} import</code> 换行粘贴 — 导入（同来源的规则会被更新）
@@ -4294,6 +4353,46 @@ export class SavePlusCore {
     }
   }
 
+  /** task cancel ID | ID,ID… | all | rule 规则ID | backup 备份ID */
+  private async cancelCommand(msg: CommandMessage, args: string[]): Promise<void> {
+    const c = commandName();
+    const scope = args[0]?.toLowerCase();
+    const usage = `用法：${c} task cancel ID[,ID…] | all | rule 规则ID | backup 备份ID`;
+    if (!scope) throw new SavePlusError("invalid", usage);
+    if (/^\d+$/.test(scope)) {
+      return this.reply(msg, `🛑 ${htmlEscape(await this.engine.cancelTask(Number(scope)))}`);
+    }
+    let match: (t: TaskRecord) => boolean;
+    let label: string;
+    if (scope === "all") {
+      match = () => true;
+      label = "全部未完成任务";
+    } else if (scope === "rule") {
+      const r = this.rule(args[1]);
+      match = (t) => t.ruleId === r.id && !t.jobId;
+      label = `规则 #${r.id} 的任务`;
+    } else if (scope === "backup") {
+      const b = this.engine.getBackup(Number(args[1]));
+      if (!b) throw new SavePlusError("invalid", `备份 ${args[1] ?? ""} 不存在`);
+      match = (t) => t.jobId === b.id;
+      label = `备份 #${b.id} 的任务（备份本身仍会继续读取，如需停止请用 backup cancel ${b.id}）`;
+    } else {
+      const ids = parseIdList(scope);
+      if (!ids) throw new SavePlusError("invalid", usage);
+      const missing = ids.filter((id) => !this.engine.getTask(id));
+      if (missing.length) throw new SavePlusError("invalid", `任务不存在：${missing.join(", ")}`);
+      const wanted = new Set(ids);
+      match = (t) => wanted.has(t.id);
+      label = `任务 ${ids.join(", ")}`;
+    }
+    const r = await this.engine.cancelMany(match);
+    if (!r.matched) return this.reply(msg, `📭 ${htmlEscape(label)}：没有可取消的任务`);
+    const lines = [`🛑 <b>已处理取消</b>：${htmlEscape(label)}`, `已取消 ${r.cancelled} 个（中转文件已删除）`];
+    if (r.stopping) lines.push(`正在停止 ${r.stopping} 个处理中的任务：中断下载后取消`);
+    if (r.afterSend) lines.push(`${r.afterSend} 个正在发送：请求无法撤回，本次发送结束后停止（已发出则保留为已完成）`);
+    return this.reply(msg, lines.join("\n"));
+  }
+
   private async taskCommand(msg: CommandMessage, args: string[]): Promise<void> {
     const op = args[0]?.toLowerCase();
     const c = commandName();
@@ -4359,7 +4458,7 @@ export class SavePlusCore {
       case "resend":
         return this.reply(msg, `📤 ${htmlEscape(await this.engine.resendTask(idArg()))}`);
       case "cancel":
-        return this.reply(msg, `🛑 ${htmlEscape(await this.engine.cancelTask(idArg()))}`);
+        return this.cancelCommand(msg, args.slice(1));
       default:
         throw new SavePlusError("invalid", `未知的 task 子命令：${args[0]}`);
     }
@@ -4697,7 +4796,11 @@ export class SavePlusCore {
       if (!Number.isInteger(id) || id <= 0) throw new SavePlusError("invalid", "请提供备份 ID");
       if (sub === "status" || sub === "show") return this.reply(msg, this.backupStatus(id));
       const job = await this.engine.setBackupState(id, sub as "pause" | "resume" | "cancel");
-      const text = { pause: "已暂停（已排队的任务会继续执行）", resume: "已继续", cancel: "已取消，未开始的任务与其中转文件已删除" }[
+      const text = {
+        pause: "已暂停（已排队的任务会继续执行）",
+        resume: "已继续",
+        cancel: "已取消：未开始的任务与其中转文件已删除，处理中的任务中断下载后取消，正在发送的任务在本次发送结束后停止",
+      }[
         sub as "pause" | "resume" | "cancel"
       ];
       return this.reply(msg, `✅ 备份 #${job.id} ${text}`);

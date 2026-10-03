@@ -25,7 +25,7 @@
 | 整个历史备份 | `.saveplus backup 来源 目标 [desc] [forward] [hide] [nofilter] [force]`、`backup list`、`backup status ID`、`backup pause\|resume\|cancel ID` |
 | 统计 | `.saveplus stats`、`.saveplus stats 规则ID`、`.saveplus stats backup 备份ID` |
 | 导出／导入 | `.saveplus export`；`.saveplus import` 换行粘贴；`.saveplus import shift [forward]` |
-| 任务 | `.saveplus status`、`task`、`task list all\|attention\|uncertain`、`task show ID`、`task retry ID\|all [force] [nocover]`、`task check ID`、`task resend ID`、`task cancel ID` |
+| 任务 | `.saveplus status`、`task`、`task list all\|attention\|uncertain`、`task show ID`、`task retry ID\|all [force] [nocover]`、`task check ID`、`task resend ID`、`task cancel ID[,ID…]\|all\|rule 规则ID\|backup 备份ID` |
 
 目标写法：`me`（收藏夹）、`local`（本地归档，仅普通手动保存）、`here`（当前会话）、`@用户名`、`t.me/用户名`、会话 ID（如 `-100123…`），可附加 `|话题ID` 投递到论坛话题。
 
@@ -101,6 +101,8 @@
 | 结果不确定 | 发送请求可能已经执行，但无法确认（如发送中断、重启时正在发送） | `task check ID` 在目标中核对；确认未发送后 `task resend ID` |
 | 已成功·待清理 | 已发送并记录成功，中转文件尚未删除 | 自动重试清理；`task retry ID` |
 | 已完成／已跳过／已取消 | 结束 | — |
+
+**取消任务**（`task cancel`）：排队中、等待重试、待处理、结果不确定的任务立即取消并删除中转文件；处理中的任务会中断下载，删除下载到一半的文件后取消；正在发送的任务因请求无法撤回，会等本次发送结束——已发出则保留为已完成，失败则不再重试，无法确认时保持“结果不确定”。批量取消可用 `task cancel all`、`task cancel rule 规则ID`、`task cancel backup 备份ID` 或 `task cancel 3,5,8`；`backup cancel ID` 同样会停止该备份处理中的任务。插件重载或停止不等于取消，处理中的任务会在重新启动后继续。
 
 磁盘空间不足时，插件会暂停开始新的下载，并在 `status` 中显示；释放空间后用 `task retry all` 恢复。
 

@@ -116,6 +116,8 @@ export class FakeTelegram implements TelegramPort {
   beforeSendResolve?: (items: StagedItem[]) => Promise<void> | void;
   stageCalls: number[] = [];
   sendWarnings: string[][] = [];
+  /** 下载中途停住（模拟大文件下载），收到中止信号时抛错。 */
+  stageGate?: Promise<void>;
   readCalls = 0;
   sendGate?: Promise<void>;
 
@@ -275,9 +277,20 @@ export class FakeTelegram implements TelegramPort {
     return id;
   }
 
-  async stageMedia(message: SourceMessage, dir: string): Promise<StagedItem> {
+  async stageMedia(message: SourceMessage, dir: string, signal?: AbortSignal): Promise<StagedItem> {
     this.stageCalls.push(message.id);
     this.take(this.failures.stage, message);
+    if (this.stageGate && message.kind !== "text") {
+      await fsp.mkdir(dir, { recursive: true });
+      await fsp.writeFile(path.join(dir, `m${message.id}_partial.bin.part`), Buffer.alloc(4096));
+      await Promise.race([
+        this.stageGate,
+        new Promise<never>((_, reject) => {
+          if (signal?.aborted) reject(new Error("download aborted"));
+          signal?.addEventListener("abort", () => reject(new Error("download aborted")), { once: true });
+        }),
+      ]);
+    }
     const item: StagedItem = {
       messageId: message.id,
       kind: message.kind,
