@@ -613,6 +613,16 @@ export interface RuleRecord extends DeliveryOptions {
   filter: FilterConfig;
   createdAt: number;
   updatedAt: number;
+  /** 最后收到的来源新消息（在线监视心跳；持久化按分钟节流，停止时补写最新值）。 */
+  lastSeen?: RuleMark;
+  /** 最后一次成功保存（监视或补漏）。 */
+  lastSaved?: RuleMark;
+}
+
+/** 某个时刻对应的来源消息。 */
+export interface RuleMark {
+  at: number;
+  messageId: number;
 }
 
 /** 一次保存所依据的配置快照：来自监视规则或整个历史备份。 */
@@ -1897,6 +1907,21 @@ export function dayKey(ms: number): string {
   return new Date(ms - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
 }
 
+/** 时长：不足 1 分钟、N 分钟、N 小时 M 分、N 天 M 小时。 */
+export function formatDuration(ms: number): string {
+  const total = Math.floor(Math.max(0, ms) / 60_000);
+  if (total < 1) return "不到 1 分钟";
+  const days = Math.floor(total / 1440);
+  const hours = Math.floor((total % 1440) / 60);
+  const minutes = total % 60;
+  if (days) return `${days} 天 ${hours} 小时`;
+  if (hours) return `${hours} 小时 ${minutes} 分`;
+  return `${minutes} 分钟`;
+}
+
+/** 最后收到消息的持久化间隔：内存中实时更新，避免每条来源消息都写一次存储。 */
+const SEEN_PERSIST_MS = 60_000;
+
 function targetLabel(t: PeerTarget): string {
   return `${t.title}${t.topicId ? ` · 话题 ${t.topicId}` : ""}`;
 }
@@ -1928,6 +1953,11 @@ export class Engine {
   private current: { id: number; controller: AbortController } | null = null;
   /** 已请求取消、但仍在处理或发送中的任务。 */
   private readonly cancelRequests = new Set<number>();
+  /** 本次加载的启动时间。 */
+  startedAt?: number;
+  /** 各规则最后收到的来源新消息（实时值）与上次持久化时间。 */
+  private readonly seen = new Map<number, RuleMark>();
+  private readonly seenPersistedAt = new Map<number, number>();
   private readonly stoppedPromise = new Promise<void>((r) => {
     this.stoppedResolve = r;
   });
@@ -1969,6 +1999,7 @@ export class Engine {
     const self = await this.port.selfId();
     this.accountId = self;
     const now = this.clock.now();
+    this.startedAt = now;
     await this.store.update((d) => {
       d.accountId = self;
       for (const t of d.tasks) {
@@ -2009,6 +2040,7 @@ export class Engine {
       ]);
       if (timer) clearTimeout(timer);
     }
+    await this.persistSeen().catch((e) => this.log("保存最后收到的消息失败", e));
     await this.store.close();
     this.stoppedResolve?.();
   }
@@ -2100,6 +2132,7 @@ export class Engine {
     if (!rule || !rule.enabled) return;
     if (edited && (!rule.handleEdited || !msg.editDate)) return;
     if (this.isOwnEcho(msg)) return;
+    if (!edited) this.noteSeen(rule, msg.id);
     const editVersion = edited ? msg.editDate : undefined;
     if (msg.groupedId) {
       this.bufferAlbum(rule, msg, editVersion);
@@ -2113,6 +2146,30 @@ export class Engine {
     } finally {
       this.intake--;
     }
+  }
+
+  /** 规则最后收到的来源新消息：优先取内存实时值，其次取持久化值。 */
+  lastSeenOf(rule: RuleRecord): RuleMark | undefined {
+    return this.seen.get(rule.id) ?? rule.lastSeen;
+  }
+
+  private noteSeen(rule: RuleRecord, messageId: number): void {
+    const now = this.clock.now();
+    const prev = this.seen.get(rule.id);
+    this.seen.set(rule.id, { at: now, messageId: Math.max(messageId, prev?.messageId ?? 0) });
+    if (now - (this.seenPersistedAt.get(rule.id) ?? 0) < SEEN_PERSIST_MS) return;
+    this.seenPersistedAt.set(rule.id, now);
+    this.persistSeen().catch((e) => this.log("保存最后收到的消息失败", e));
+  }
+
+  private async persistSeen(): Promise<void> {
+    if (!this.seen.size || this.store.isClosed) return;
+    await this.store.update((d) => {
+      for (const r of d.rules) {
+        const mark = this.seen.get(r.id);
+        if (mark && mark.at >= (r.lastSeen?.at ?? 0)) r.lastSeen = { ...mark };
+      }
+    });
   }
 
   private bufferAlbum(rule: RuleRecord, msg: SourceMessage, editVersion?: number): void {
@@ -2600,6 +2657,9 @@ export class Engine {
       if (t.jobId) {
         const job = d.backups.find((b) => b.id === t.jobId);
         if (job) job.counts.done += 1;
+      } else {
+        const rule = d.rules.find((r) => r.id === t.ruleId);
+        if (rule) rule.lastSaved = { at: now, messageId: Math.max(...t.memberIds) };
       }
       const day = dayKey(now);
       const scope = t.jobId ? `backup:${t.jobId}` : `rule:${t.ruleId}`;
@@ -4870,6 +4930,11 @@ export class SavePlusCore {
     return lines.join("\n");
   }
 
+  /** TeleBox 进程已运行的时长（插件重载不会重置）。 */
+  processUptimeMs(): number {
+    return process.uptime() * 1000;
+  }
+
   statusText(): string {
     const d = this.store.data;
     const counts = new Map<TaskStatus, number>();
@@ -4877,12 +4942,30 @@ export class SavePlusCore {
     const order: TaskStatus[] = ["queued", "running", "sending", "retry_wait", "needs_attention", "uncertain", "cleanup_pending"];
     const active = order.filter((s) => counts.get(s)).map((s) => `${STATUS_LABEL[s]} ${counts.get(s)}`);
     const enabled = d.rules.filter((r) => r.enabled).length;
+    const now = this.engine.clock.now();
+    const startedAt = this.engine.startedAt ?? now;
+    const mark = (m: RuleMark | undefined) =>
+      m
+        ? `${new Date(m.at).toLocaleString()}（${now - m.at < 60_000 ? "刚刚" : `${formatDuration(now - m.at)}前`} · 消息 ${m.messageId}）`
+        : "暂无记录";
     const lines = [
       "📊 <b>SavePlus 状态</b>",
+      `运行时长：TeleBox 进程 ${formatDuration(this.processUptimeMs())} · 插件本次加载 ${formatDuration(now - startedAt)}`,
       `监视规则：${d.rules.length}（运行 ${enabled} · 暂停 ${d.rules.length - enabled}）`,
-      `未完成任务：${active.length ? active.join(" · ") : "无"}`,
-      `成功保存记录：${Object.keys(d.successes).length} 条`,
     ];
+    for (const r of d.rules) {
+      const seen = this.engine.lastSeenOf(r);
+      const quiet = r.enabled && seen && seen.at < startedAt ? "；本次加载后尚未收到" : "";
+      lines.push(
+        this.ruleSummary(r),
+        `　最后收到新消息：${mark(seen)}${quiet}`,
+        `　最后成功保存：${mark(r.lastSaved)}`
+      );
+    }
+    lines.push(
+      `未完成任务：${active.length ? active.join(" · ") : "无"}`,
+      `成功保存记录：${Object.keys(d.successes).length} 条`
+    );
     const cooldown = this.engine.cooldownRemainingMs;
     if (cooldown > 0) lines.push(`⏳ 限流冷却中：剩余 ${Math.ceil(cooldown / 1000)} 秒`);
     if (d.hold) lines.push(`⛔ 执行已暂停：${htmlEscape(d.hold.reason)}（处理后用 task retry all 恢复）`);
@@ -4892,7 +4975,7 @@ export class SavePlusCore {
         lines.push(`• ${s.jobId ? `备份 #${s.jobId}` : `规则 #${s.ruleId}`} 消息 ${s.messageIds.join(",")}：${htmlEscape(s.reason)}`);
       }
     }
-    lines.push("在线监视只处理插件运行期间收到的新消息；离线期间的缺口请用 fill 手动补漏。");
+    lines.push("在线监视只处理插件运行期间收到的新消息；停机或重载期间的缺口，请从“最后收到”的消息之后用 fill 手动补漏。");
     return lines.join("\n");
   }
 }
